@@ -75,10 +75,13 @@ private:
     void applyCrossfeed (juce::AudioBuffer<float>& buffer, float amount);
     void resetCrossfeed();
     void rebuildCurveFIR();
+    void rebuildFromStoredCurve();
     int findImpulseResponsePeak (const juce::AudioBuffer<float>& impulse);
     int getLatencyForPhaseMode (PhaseMode mode, int taps) const;
     int getDefaultFirTapsForMode (PhaseMode mode) const;
     void applyActiveLatency (int latencySamples);
+    void addStoredCurveToState (juce::ValueTree& state) const;
+    bool restoreStoredCurveFromState (const juce::ValueTree& state, const juce::String& fallbackName);
 
     juce::dsp::Convolution convolution;
     float limiterGain = 1.0f;

@@ -354,6 +354,7 @@ bool CalCurveAudioProcessor::savePresetToFile (const juce::File& file, const juc
     state.setProperty ("presetName", newPresetName, nullptr);
     state.setProperty ("loadedFilePath", loadedCurveFile.getFullPathName(), nullptr);
     state.setProperty ("loadedName", loadedName, nullptr);
+    addStoredCurveToState (state);
 
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
 
@@ -374,9 +375,11 @@ bool CalCurveAudioProcessor::loadPresetFromFile (const juce::File& file)
     auto state = juce::ValueTree::fromXml (*xml);
     const auto path = state.getProperty ("loadedFilePath").toString();
     presetName = state.getProperty ("presetName", file.getFileNameWithoutExtension()).toString();
+    const auto storedLoadedName = state.getProperty ("loadedName", presetName).toString();
 
     parameters.replaceState (state);
 
+    bool restoredFromFile = false;
     if (path.isNotEmpty())
     {
         const juce::File calibrationFile (path);
@@ -387,13 +390,17 @@ bool CalCurveAudioProcessor::loadPresetFromFile (const juce::File& file)
                 loadImpulseResponse (calibrationFile);
             else
                 loadCorrectionCurve (calibrationFile);
+
+            restoredFromFile = true;
         }
         else
-        {
-            loadedName = "Missing: " + calibrationFile.getFileName();
             loadedCurveFile = calibrationFile;
-            hasImpulse = false;
-        }
+    }
+
+    if (! restoredFromFile && ! restoreStoredCurveFromState (state, storedLoadedName))
+    {
+        loadedName = path.isNotEmpty() ? "Missing: " + juce::File (path).getFileName() : storedLoadedName;
+        hasImpulse = false;
     }
 
     return true;
@@ -496,6 +503,38 @@ void CalCurveAudioProcessor::rebuildCurveFIR()
         else
             loadCorrectionCurve (loadedCurveFile);
     }
+    else
+    {
+        rebuildFromStoredCurve();
+    }
+}
+
+void CalCurveAudioProcessor::rebuildFromStoredCurve()
+{
+    std::vector<CurvePoint> points;
+    {
+        const juce::ScopedLock lock (curveLock);
+        points = correctionCurve;
+    }
+
+    if (points.empty())
+        return;
+
+    updateWetAutoGain (points, currentSampleRate);
+    const auto phaseMode = getPhaseMode();
+    const auto firTaps = getDefaultFirTapsForMode (phaseMode);
+    auto impulse = createImpulseForPhaseMode (points, currentSampleRate, firTaps);
+
+    activeImpulsePeakSamples = findImpulseResponsePeak (impulse);
+    applyActiveLatency (getLatencyForPhaseMode (phaseMode, firTaps));
+
+    convolution.loadImpulseResponse (std::move (impulse),
+                                     currentSampleRate,
+                                     juce::dsp::Convolution::Stereo::no,
+                                     juce::dsp::Convolution::Trim::no,
+                                     juce::dsp::Convolution::Normalise::no);
+
+    hasImpulse = true;
 }
 
 void CalCurveAudioProcessor::resetCrossfeed()
@@ -549,12 +588,74 @@ void CalCurveAudioProcessor::applyCrossfeed (juce::AudioBuffer<float>& buffer, f
     }
 }
 
+void CalCurveAudioProcessor::addStoredCurveToState (juce::ValueTree& state) const
+{
+    state.removeChild (state.getChildWithName ("StoredCorrectionCurve"), nullptr);
+
+    std::vector<CurvePoint> points;
+    {
+        const juce::ScopedLock lock (curveLock);
+        points = correctionCurve;
+    }
+
+    if (points.empty())
+        return;
+
+    juce::ValueTree curve ("StoredCorrectionCurve");
+    curve.setProperty ("format", "frequencyDbPoints", nullptr);
+    curve.setProperty ("pointCount", static_cast<int> (points.size()), nullptr);
+
+    for (const auto& point : points)
+    {
+        juce::ValueTree pointNode ("Point");
+        pointNode.setProperty ("frequency", point.frequency, nullptr);
+        pointNode.setProperty ("db", point.db, nullptr);
+        curve.appendChild (pointNode, nullptr);
+    }
+
+    state.appendChild (curve, nullptr);
+}
+
+bool CalCurveAudioProcessor::restoreStoredCurveFromState (const juce::ValueTree& state, const juce::String& fallbackName)
+{
+    const auto curve = state.getChildWithName ("StoredCorrectionCurve");
+
+    if (! curve.isValid())
+        return false;
+
+    std::vector<CurvePoint> points;
+    points.reserve (static_cast<size_t> (curve.getNumChildren()));
+
+    for (int i = 0; i < curve.getNumChildren(); ++i)
+    {
+        const auto pointNode = curve.getChild (i);
+        const auto frequency = static_cast<double> (pointNode.getProperty ("frequency", 0.0));
+        const auto db = static_cast<double> (pointNode.getProperty ("db", 0.0));
+
+        if (frequency > 0.0 && std::isfinite (frequency) && std::isfinite (db))
+            points.push_back ({ frequency, db });
+    }
+
+    if (points.empty())
+        return false;
+
+    {
+        const juce::ScopedLock lock (curveLock);
+        correctionCurve = std::move (points);
+    }
+
+    loadedName = fallbackName.isNotEmpty() ? fallbackName + " (embedded preset curve)" : "Embedded preset curve";
+    rebuildFromStoredCurve();
+    return hasImpulse;
+}
+
 void CalCurveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = parameters.copyState();
     state.setProperty ("presetName", presetName, nullptr);
     state.setProperty ("loadedFilePath", loadedCurveFile.getFullPathName(), nullptr);
     state.setProperty ("loadedName", loadedName, nullptr);
+    addStoredCurveToState (state);
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
     copyXmlToBinary (*xml, destData);
 }
@@ -584,6 +685,7 @@ void CalCurveAudioProcessor::setStateInformation (const void* data, int sizeInBy
                 phaseMode->setValueNotifyingHost (0.0f);
         }
 
+        bool restoredFromFile = false;
         if (path.isNotEmpty())
         {
             const juce::File calibrationFile (path);
@@ -594,17 +696,23 @@ void CalCurveAudioProcessor::setStateInformation (const void* data, int sizeInBy
                     loadImpulseResponse (calibrationFile);
                 else
                     loadCorrectionCurve (calibrationFile);
+
+                restoredFromFile = true;
             }
             else
             {
-                loadedName = "Missing: " + calibrationFile.getFileName();
                 loadedCurveFile = calibrationFile;
-                hasImpulse = false;
             }
         }
-        else if (storedLoadedName.isNotEmpty())
+        
+        if (! restoredFromFile && ! restoreStoredCurveFromState (state, storedLoadedName))
         {
-            loadedName = storedLoadedName;
+            if (path.isNotEmpty())
+                loadedName = "Missing: " + juce::File (path).getFileName();
+            else if (storedLoadedName.isNotEmpty())
+                loadedName = storedLoadedName;
+
+            hasImpulse = false;
         }
     }
 }

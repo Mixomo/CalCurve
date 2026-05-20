@@ -31,8 +31,34 @@ The tool is intentionally narrow: it does not include a headphone database, head
 
 ## Presets
 
-- User presets use `.calcurvepreset` files.
-- A preset stores parameter values, the custom preset name, and the path to the loaded calibration file.
+The `Presets` menu lets you select, save, and delete user presets from inside the plugin.
+
+- `Select user preset...` is the default empty menu entry.
+- Existing presets appear below it.
+- `Save current preset...` asks for a preset name and writes a `.calcurvepreset` file.
+- `Delete current preset...` deletes the currently loaded custom preset.
+
+On Windows, user presets are stored in the application data folder:
+
+```text
+%APPDATA%\Mixomo\CalCurve\UserPresets\
+```
+
+CalCurve creates this folder automatically when the presets menu is used.
+
+A preset stores:
+
+- Dry/Wet, Crossfeed, Gain, Phase Mode, Limiter, and Bypass state
+- the custom preset name
+- the path to the loaded calibration file
+- the loaded file label shown in the interface
+- an embedded copy of the loaded correction curve as frequency/dB points
+
+When a preset is loaded, CalCurve first tries to reload the original file from the saved path. If the file is still there, it uses the file so the preset follows any deliberate updates you made to that calibration.
+
+If the original file is missing, renamed, or moved, CalCurve falls back to the embedded frequency/dB curve stored inside the preset and rebuilds the FIR from that. This makes presets portable and keeps them useful even when the original calibration file is no longer available.
+
+For WAV FIR files, the preset embeds the magnitude curve extracted from the WAV, not the raw WAV samples. The selected Phase Mode still regenerates the active FIR from that embedded curve.
 
 ## Graph
 

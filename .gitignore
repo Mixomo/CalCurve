@@ -1,0 +1,37 @@
+*
+
+# Repository metadata
+!.gitignore
+!.gitattributes
+
+# Project files
+!CMakeLists.txt
+!LICENSE
+!README.md
+!THIRD_PARTY_NOTICES.md
+
+# Ready-to-copy VST3 bundle
+!CalCurve_VST3/
+!CalCurve_VST3/**
+
+# Source code
+!Source/
+!Source/CurveFIR.h
+!Source/CurveFIR.cpp
+!Source/PluginEditor.h
+!Source/PluginEditor.cpp
+!Source/PluginProcessor.h
+!Source/PluginProcessor.cpp
+
+# Build helper files
+!cmake/
+!cmake/*.cmake
+
+# Tools and tests
+!tools/
+!tools/*.py
+!tools/*.cpp
+
+# Assets
+!assets/
+!assets/VST_GUI.png

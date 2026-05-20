@@ -6,6 +6,24 @@ CalCurve loads local headphone calibration files and applies them as convolution
 
 The tool is intentionally narrow: it does not include a headphone database, headphone simulation, or target selection. It assumes the loaded file is already an exported/calibrated correction curve.
 
+## FIR and Convolution
+
+An FIR, or finite impulse response, is a filter stored as a short audio-like impulse. When audio passes through that impulse by convolution, the frequency response of the impulse is applied to the signal.
+
+In CalCurve, the loaded calibration is turned into an FIR filter when needed, then applied with convolution. A WAV FIR can be loaded directly. TXT and CSV correction curves are first converted into an internal FIR, then processed the same way.
+
+This is why FIR and convolution are linked here: the FIR is the correction filter, and convolution is the process that applies that filter to the audio.
+
+Compared with a simple frequency/gain correction curve, an FIR has a few practical advantages:
+
+- it turns the whole correction into one continuous filter instead of a set of separate EQ points
+- it can represent very detailed correction shapes without needing many individual EQ bands
+- it can preserve or intentionally reshape phase behavior depending on the selected phase mode
+- it makes TXT/CSV curves and WAV impulse responses share the same convolution engine
+- it allows CalCurve to offer Minimum, Natural, and Linear phase versions of the same correction curve
+
+The TXT/CSV curve is still useful as an editable and portable description of the correction. CalCurve uses that curve as the source, then generates the FIR that actually processes the audio.
+
 ## Supported Formats
 
 - WAV FIR impulse responses

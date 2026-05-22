@@ -40,11 +40,12 @@ The TXT/CSV curve is still useful as an editable and portable description of the
 - **Gain:** final output trim in dB.
 - **Phase Mode:** selects the FIR phase engine.
   - **Minimum:** causal minimum-phase FIR, zero reported latency.
-  - **Natural:** mixed-phase FIR with 1024 samples of latency and reduced pre-ringing.
-  - **Linear:** symmetric linear-phase FIR with 4096 samples of latency and flat phase.
+  - **Natural:** mixed-phase FIR with latency scaled from 1024 samples at 44.1 kHz and reduced pre-ringing.
+  - **Linear:** symmetric linear-phase FIR with latency scaled from 4096 samples at 44.1 kHz and flat phase.
 - **Auto Gain:** hidden internal compensation. When a curve or FIR is loaded, CalCurve estimates the perceived K-weighted loudness change and applies compensation to the corrected wet path. This keeps Dry/Wet and Bypass A/B comparisons closer in perceived level without moving the Gain knob.
 - **Limiter:** safety limiter to reduce accidental clipping.
 - **Load TXT / CSV / FIR:** opens a local calibration file.
+- **Export FIR:** writes the active correction as a mono 32-bit WAV FIR using the current host sample rate and selected Phase Mode. Auto Gain is not baked into the exported FIR.
 - **Help:** opens the in-plugin reference window.
 
 ## Presets
@@ -88,19 +89,21 @@ For WAV FIR files, the preset embeds the magnitude curve extracted from the WAV,
 
 ## Phase Engines
 
-CalCurve regenerates the active FIR whenever the phase mode changes.
+CalCurve regenerates the active FIR whenever the phase mode changes or when the host sample rate changes.
 
 - TXT and CSV files are parsed into a correction curve, then converted to FIR using the selected phase engine.
 - WAV FIR files are converted to a magnitude curve, then regenerated into the selected phase engine so Minimum, Natural, and Linear remain consistent.
-- The plugin reports latency changes to the host when the mode changes.
+- The plugin reports latency changes to the host when the mode or sample rate changes.
+- FIR tap counts and latency are scaled from a 44.1 kHz reference to preserve the same time/frequency resolution across host sample rates. This keeps the correction curve stable at 44.1, 48, 88.2, 96, 176.4, 192 kHz, and other rates.
+- If you export FIR WAVs for use in another convolver, export one FIR per sample rate you plan to use. Inside CalCurve this is handled automatically at load/rebuild time.
 
-Measured test values at 48 kHz:
+Reference values at 44.1 kHz:
 
-| Mode | FIR Type | Peak / Latency |
-| --- | --- | --- |
-| Minimum | Minimum phase | ~0 samples |
-| Natural | Mixed phase | 1024 samples |
-| Linear | Linear phase | 4096 samples |
+| Mode | FIR Type | Reference Taps | Reference Latency |
+| --- | --- | ---: | ---: |
+| Minimum | Minimum phase | 4096 | 0 samples |
+| Natural | Mixed phase | 4096 | 1024 samples |
+| Linear | Linear phase | 8192 | 4096 samples |
 
 Some DAWs may compensate plugin delay during playback or monitoring. The plugin GUI shows the active reported latency and FIR peak to make the selected mode visible.
 

@@ -6,6 +6,8 @@
 
 namespace
 {
+    constexpr int maxFirTaps = 65536;
+
     struct ParametricBand
     {
         double frequency = 1000.0;
@@ -249,31 +251,37 @@ juce::AudioBuffer<float> CurveFIR::createLinearPhaseFIR (const std::vector<Curve
                                                          double sampleRate,
                                                          int taps)
 {
-    taps = juce::jlimit (256, 16384, taps);
-    const auto fftSize = juce::nextPowerOfTwo (taps * 2);
+    taps = juce::jlimit (256, maxFirTaps, taps);
+    const auto fftSize = juce::nextPowerOfTwo (taps * 4);
+    const auto order = fftOrderForSize (fftSize);
     const auto halfBins = fftSize / 2;
-
-    juce::AudioBuffer<float> impulse (1, taps);
-    impulse.clear();
-
-    auto* out = impulse.getWritePointer (0);
     const auto centre = taps / 2;
 
-    for (int n = 0; n < taps; ++n)
+    juce::dsp::FFT fft (order);
+    std::vector<juce::dsp::Complex<float>> spectrum (static_cast<size_t> (fftSize), { 0.0f, 0.0f });
+    std::vector<juce::dsp::Complex<float>> timeDomain (static_cast<size_t> (fftSize));
+
+    juce::AudioBuffer<float> impulse (1, taps);
+    auto* out = impulse.getWritePointer (0);
+
+    for (int k = 0; k <= halfBins; ++k)
     {
-        const auto m = n - centre;
-        double value = 0.0;
+        const auto frequency = (static_cast<double> (k) * sampleRate) / fftSize;
+        const auto gain = juce::Decibels::decibelsToGain (interpolateDb (points, frequency));
+        const auto phase = -juce::MathConstants<double>::twoPi * static_cast<double> (k) * static_cast<double> (centre) / fftSize;
+        const auto value = juce::dsp::Complex<float> (static_cast<float> (gain * std::cos (phase)),
+                                                       static_cast<float> (gain * std::sin (phase)));
 
-        for (int k = 0; k <= halfBins; ++k)
-        {
-            const auto frequency = (static_cast<double> (k) * sampleRate) / fftSize;
-            const auto gain = juce::Decibels::decibelsToGain (interpolateDb (points, frequency));
-            const auto weight = (k == 0 || k == halfBins) ? 1.0 : 2.0;
-            value += weight * gain * std::cos (juce::MathConstants<double>::twoPi * k * m / fftSize);
-        }
+        spectrum[static_cast<size_t> (k)] = value;
 
-        out[n] = static_cast<float> (value / fftSize) * hann (n, taps);
+        if (k > 0 && k < halfBins)
+            spectrum[static_cast<size_t> (fftSize - k)] = std::conj (value);
     }
+
+    fft.perform (spectrum.data(), timeDomain.data(), true);
+
+    for (int n = 0; n < taps; ++n)
+        out[n] = timeDomain[static_cast<size_t> (n)].real() * hann (n, taps);
 
     return impulse;
 }
@@ -282,7 +290,7 @@ juce::AudioBuffer<float> CurveFIR::createMinimumPhaseFIR (const std::vector<Curv
                                                           double sampleRate,
                                                           int taps)
 {
-    taps = juce::jlimit (256, 16384, taps);
+    taps = juce::jlimit (256, maxFirTaps, taps);
 
     // The minimum-phase FIR is derived from the linear-phase FIR via the
     // homomorphic (cepstral) method:
@@ -379,7 +387,7 @@ juce::AudioBuffer<float> CurveFIR::createMixedPhaseFIR (const std::vector<CurveP
                                                         float minimumPhaseWeight,
                                                         int latencySamples)
 {
-    taps               = juce::jlimit (256, 16384, taps);
+    taps               = juce::jlimit (256, maxFirTaps, taps);
     minimumPhaseWeight = juce::jlimit (0.0f, 1.0f, minimumPhaseWeight);
     latencySamples     = juce::jlimit (0, taps - 1, latencySamples);
 

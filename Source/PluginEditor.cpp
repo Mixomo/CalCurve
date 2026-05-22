@@ -24,11 +24,12 @@ namespace
             "- Dry/Wet: blends the latency-aligned dry signal with the corrected wet signal. At 0% the graph is flat; at 100% it shows the full loaded correction.\n\n"
             "- Crossfeed: stereo headphone crossfeed. It narrows side information and adds a small delayed, low-passed opposite-channel feed for more natural headphone listening.\n\n"
             "- Gain: final output trim in dB, applied after Dry/Wet and Crossfeed.\n\n"
-            "- Phase Mode: regenerates the active FIR whenever the mode changes. Minimum uses a 4096-tap minimum-phase FIR and reports 0 samples. Natural uses a 4096-tap mixed-phase FIR, 0.72 minimum-phase weighting, and reports 1024 samples. Linear uses an 8192-tap symmetric linear-phase FIR and reports 4096 samples.\n\n"
+            "- Phase Mode: regenerates the active FIR whenever the mode changes. FIR length and latency are scaled from a 44.1 kHz reference so the correction keeps the same time/frequency resolution at 48, 96, 192 kHz, and other host sample rates. At 44.1 kHz, Minimum uses a 4096-tap minimum-phase FIR and reports 0 samples; Natural uses a 4096-tap mixed-phase FIR with 0.72 minimum-phase weighting and reports 1024 samples; Linear uses an 8192-tap symmetric linear-phase FIR and reports 4096 samples.\n\n"
             "- Auto Gain (hidden): when a curve or FIR is loaded, CalCurve estimates the K-weighted perceived loudness change and applies a clamped -18 dB to +18 dB compensation to the corrected wet path. The Gain knob is not moved.\n\n"
             "- Limiter: optional safety limiter. It only reduces gain when the output peak exceeds 0 dBFS, uses instant attack, smooth release, and a final hard clip as a last safety stage.\n\n"
             "- Bypass: passes the input through. When a latency-producing phase mode is active, the bypass path is delayed to match the current reported latency.\n\n"
             "- Load TXT / CSV / FIR: opens a local calibration file.\n\n"
+            "- Export FIR: writes the active correction as a mono 32-bit WAV FIR using the current host sample rate and selected Phase Mode. Auto Gain is not baked into the exported FIR.\n\n"
             "Presets and state\n\n"
             "- The Presets menu can select user presets, save the current preset, and delete the active custom preset.\n\n"
             "- On Windows, user presets are stored in %APPDATA%/Mixomo/CalCurve/UserPresets as .calcurvepreset files. CalCurve creates this folder automatically.\n\n"
@@ -47,8 +48,9 @@ namespace
             "- TXT and CSV files are parsed into a correction curve, then converted to FIR using the selected phase engine.\n\n"
             "- WAV FIR files are converted to a magnitude curve, then regenerated into the selected phase engine so Minimum, Natural, and Linear remain consistent.\n\n"
             "- Minimum is minimum phase with near-zero FIR peak and 0 reported samples.\n\n"
-            "- Natural is mixed phase with 1024 reported samples.\n\n"
-            "- Linear is linear phase with 4096 reported samples.\n\n"
+            "- Natural is mixed phase with latency scaled from 1024 samples at 44.1 kHz.\n\n"
+            "- Linear is linear phase with latency scaled from 4096 samples at 44.1 kHz.\n\n"
+            "- FIR tap counts are also scaled with the host sample rate. This keeps the EQ curve stable instead of changing shape at high sample rates.\n\n"
             "- Some DAWs may compensate or hide plugin latency during playback or monitoring, but the GUI latency and IR peak readout show the active engine.\n\n"
             "Credits\n\n"
             "- Development: Ezequiel Casas (Mixomo)\n\n"
@@ -357,6 +359,12 @@ CalCurveAudioProcessorEditor::CalCurveAudioProcessorEditor (CalCurveAudioProcess
     addAndMakeVisible (loadFile);
 
     loadFile.onClick = [this] { openFileChooser(); };
+    exportFir.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1f2630));
+    exportFir.setColour (juce::TextButton::buttonOnColourId, accentColour().darker());
+    exportFir.setColour (juce::TextButton::textColourOffId, inkColour());
+    exportFir.onClick = [this] { openExportFirChooser(); };
+    addAndMakeVisible (exportFir);
+
     help.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1f2630));
     help.setColour (juce::TextButton::textColourOffId, inkColour());
     help.onClick = [this] { showHelp(); };
@@ -417,6 +425,8 @@ void CalCurveAudioProcessorEditor::resized()
     presetCombo.setBounds (header.removeFromLeft (160).withHeight (36).translated (0, 2));
 
     help.setBounds (header.removeFromRight (50).withHeight (36).translated (0, 2));
+    header.removeFromRight (8);
+    exportFir.setBounds (header.removeFromRight (112).withHeight (36).translated (0, 2));
     header.removeFromRight (8);
     loadFile.setBounds (header.removeFromRight (180).withHeight (36).translated (0, 2));
     loadedFile.setBounds (area.removeFromTop (24));
@@ -490,6 +500,50 @@ void CalCurveAudioProcessorEditor::openFileChooser()
                     safeThis->processor.loadImpulseResponse (file);
                 else
                     safeThis->processor.loadCorrectionCurve (file);
+            }
+        });
+}
+
+void CalCurveAudioProcessorEditor::openExportFirChooser()
+{
+    const auto sampleRate = processor.getCurrentSampleRate() > 1.0 ? processor.getCurrentSampleRate() : 44100.0;
+    const auto phaseName = phaseMode.getText().isNotEmpty() ? phaseMode.getText() : "Natural";
+    auto baseName = processor.getPresetName().trim();
+    if (baseName.isEmpty() || baseName == "Untitled")
+        baseName = "CalCurve";
+
+    auto safeName = baseName.replaceCharacters ("\\/:*?\"<>| ", "__________")
+                    + "_"
+                    + phaseName
+                    + "_"
+                    + juce::String (juce::roundToInt (sampleRate))
+                    + "Hz_FIR.wav";
+
+    chooser = std::make_unique<juce::FileChooser> ("Export current FIR WAV",
+                                                   juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                                                       .getChildFile (safeName),
+                                                   "*.wav");
+    const juce::Component::SafePointer<CalCurveAudioProcessorEditor> safeThis (this);
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode
+                           | juce::FileBrowserComponent::canSelectFiles
+                           | juce::FileBrowserComponent::warnAboutOverwriting,
+        [safeThis] (const juce::FileChooser& fc)
+        {
+            if (safeThis == nullptr)
+                return;
+
+            auto file = fc.getResult();
+            if (file == juce::File{})
+                return;
+
+            if (! file.hasFileExtension ("wav"))
+                file = file.withFileExtension ("wav");
+
+            if (! safeThis->processor.exportCurrentFirToFile (file))
+            {
+                juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                        "Export FIR",
+                                                        "Could not export the FIR. Load a curve or FIR first, then try again.");
             }
         });
 }

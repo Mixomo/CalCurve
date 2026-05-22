@@ -4,10 +4,12 @@
 
 namespace
 {
-    constexpr int minimumPhaseTaps = 4096;
-    constexpr int naturalPhaseTaps = 4096;
-    constexpr int linearPhaseTaps = 8192;
-    constexpr int naturalLatencySamples = 1024;
+    constexpr double referenceSampleRate = 44100.0;
+    constexpr int minimumPhaseReferenceTaps = 4096;
+    constexpr int naturalPhaseReferenceTaps = 4096;
+    constexpr int linearPhaseReferenceTaps = 8192;
+    constexpr int naturalReferenceLatencySamples = 1024;
+    constexpr int maxFirTaps = 65536;
 }
 
 CalCurveAudioProcessor::CalCurveAudioProcessor()
@@ -59,6 +61,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout CalCurveAudioProcessor::crea
 
 void CalCurveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    const auto previousSampleRate = currentSampleRate;
     currentSampleRate = sampleRate;
 
     juce::dsp::ProcessSpec spec;
@@ -75,9 +78,12 @@ void CalCurveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     crossfeedDelay.setSize (2, juce::jmax (32, static_cast<int> (std::ceil (sampleRate * 0.001))));
     resetCrossfeed();
 
-    dryDelayBuffer.setSize (getTotalNumOutputChannels(), 32768);
+    dryDelayBuffer.setSize (getTotalNumOutputChannels(), 131072);
     dryDelayBuffer.clear();
     dryDelayWriteIndex = 0;
+
+    if (! juce::approximatelyEqual (previousSampleRate, currentSampleRate))
+        rebuildFromStoredCurve();
 }
 
 bool CalCurveAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -261,11 +267,12 @@ void CalCurveAudioProcessor::loadImpulseResponse (const juce::File& file)
             const juce::ScopedLock lock (curveLock);
             correctionCurve = CurveFIR::createMagnitudeCurveFromImpulse (impulse, reader->sampleRate);
         }
-        updateWetAutoGain (correctionCurve, reader->sampleRate);
+        const auto synthesisSampleRate = currentSampleRate > 0.0 ? currentSampleRate : reader->sampleRate;
+        updateWetAutoGain (correctionCurve, synthesisSampleRate);
 
         const auto phaseMode = getPhaseMode();
-        const auto taps = juce::jlimit (256, 16384, juce::jmax (getDefaultFirTapsForMode (phaseMode), impulse.getNumSamples()));
-        auto monoImpulse = createImpulseForPhaseMode (correctionCurve, reader->sampleRate, taps);
+        const auto taps = juce::jlimit (256, maxFirTaps, juce::jmax (getDefaultFirTapsForMode (phaseMode), scaleReferenceSampleCount (impulse.getNumSamples())));
+        auto monoImpulse = createImpulseForPhaseMode (correctionCurve, synthesisSampleRate, taps);
 
         impulse.setSize (static_cast<int> (reader->numChannels), taps);
         for (int ch = 0; ch < static_cast<int> (reader->numChannels); ++ch)
@@ -275,7 +282,7 @@ void CalCurveAudioProcessor::loadImpulseResponse (const juce::File& file)
         applyActiveLatency (getLatencyForPhaseMode (phaseMode, impulse.getNumSamples()));
 
         convolution.loadImpulseResponse (std::move (impulse),
-                                         reader->sampleRate,
+                                         synthesisSampleRate,
                                          juce::dsp::Convolution::Stereo::yes,
                                          juce::dsp::Convolution::Trim::no,
                                          juce::dsp::Convolution::Normalise::no);
@@ -308,6 +315,47 @@ void CalCurveAudioProcessor::loadCorrectionCurve (const juce::File& file)
 
     const juce::ScopedLock lock (curveLock);
     correctionCurve = std::move (points);
+}
+
+bool CalCurveAudioProcessor::exportCurrentFirToFile (const juce::File& file)
+{
+    std::vector<CurvePoint> points;
+    {
+        const juce::ScopedLock lock (curveLock);
+        points = correctionCurve;
+    }
+
+    if (points.empty())
+        return false;
+
+    const auto sampleRate = currentSampleRate > 0.0 ? currentSampleRate : referenceSampleRate;
+    const auto phaseMode = getPhaseMode();
+    const auto taps = getDefaultFirTapsForMode (phaseMode);
+    auto impulse = createImpulseForPhaseMode (points, sampleRate, taps);
+
+    if (impulse.getNumSamples() <= 0)
+        return false;
+
+    juce::WavAudioFormat wavFormat;
+
+    if (file.existsAsFile() && ! file.deleteFile())
+        return false;
+
+    std::unique_ptr<juce::FileOutputStream> stream (file.createOutputStream());
+    if (stream == nullptr || ! stream->openedOk())
+        return false;
+
+    std::unique_ptr<juce::AudioFormatWriter> writer (wavFormat.createWriterFor (stream.get(),
+                                                                                 sampleRate,
+                                                                                 1,
+                                                                                 32,
+                                                                                 {},
+                                                                                 0));
+    if (writer == nullptr)
+        return false;
+
+    stream.release();
+    return writer->writeFromAudioSampleBuffer (impulse, 0, impulse.getNumSamples());
 }
 
 int CalCurveAudioProcessor::findImpulseResponsePeak (const juce::AudioBuffer<float>& impulse)
@@ -430,7 +478,7 @@ juce::AudioBuffer<float> CalCurveAudioProcessor::createImpulseForPhaseMode (cons
             return CurveFIR::createMinimumPhaseFIR (points, sampleRate, taps);
 
         case PhaseMode::natural:
-            return CurveFIR::createMixedPhaseFIR (points, sampleRate, taps, 0.72f, juce::jlimit (0, taps - 1, naturalLatencySamples));
+            return CurveFIR::createMixedPhaseFIR (points, sampleRate, taps, 0.72f, juce::jlimit (0, taps - 1, scaleReferenceSampleCount (naturalReferenceLatencySamples)));
 
         case PhaseMode::linear:
         default:
@@ -442,12 +490,12 @@ int CalCurveAudioProcessor::getDefaultFirTapsForMode (PhaseMode mode) const
 {
     switch (mode)
     {
-        case PhaseMode::minimum: return minimumPhaseTaps;
-        case PhaseMode::natural: return naturalPhaseTaps;
-        case PhaseMode::linear:  return linearPhaseTaps;
+        case PhaseMode::minimum: return scaleReferenceSampleCount (minimumPhaseReferenceTaps);
+        case PhaseMode::natural: return scaleReferenceSampleCount (naturalPhaseReferenceTaps);
+        case PhaseMode::linear:  return scaleReferenceSampleCount (linearPhaseReferenceTaps);
     }
 
-    return naturalPhaseTaps;
+    return scaleReferenceSampleCount (naturalPhaseReferenceTaps);
 }
 
 int CalCurveAudioProcessor::getLatencyForPhaseMode (PhaseMode mode, int taps) const
@@ -455,11 +503,23 @@ int CalCurveAudioProcessor::getLatencyForPhaseMode (PhaseMode mode, int taps) co
     switch (mode)
     {
         case PhaseMode::minimum: return 0;
-        case PhaseMode::natural: return juce::jlimit (0, juce::jmax (0, taps - 1), naturalLatencySamples);
+        case PhaseMode::natural: return juce::jlimit (0, juce::jmax (0, taps - 1), scaleReferenceSampleCount (naturalReferenceLatencySamples));
         case PhaseMode::linear:  return juce::jmax (0, taps / 2);
     }
 
     return 0;
+}
+
+int CalCurveAudioProcessor::scaleReferenceSampleCount (int referenceSamples) const
+{
+    const auto safeSampleRate = currentSampleRate > 0.0 ? currentSampleRate : referenceSampleRate;
+    auto scaled = static_cast<int> (std::round (static_cast<double> (referenceSamples) * safeSampleRate / referenceSampleRate));
+    scaled = juce::jlimit (256, maxFirTaps, scaled);
+
+    if ((scaled & 1) != 0)
+        ++scaled;
+
+    return juce::jmin (scaled, maxFirTaps);
 }
 
 void CalCurveAudioProcessor::applyActiveLatency (int latencySamples)

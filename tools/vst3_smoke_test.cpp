@@ -6,6 +6,19 @@
 
 namespace
 {
+    constexpr double referenceSampleRate = 44100.0;
+
+    int scaleReferenceSamples (int referenceSamples, double sampleRate)
+    {
+        auto scaled = static_cast<int> (std::round (static_cast<double> (referenceSamples) * sampleRate / referenceSampleRate));
+        scaled = juce::jlimit (256, 65536, scaled);
+
+        if ((scaled & 1) != 0)
+            ++scaled;
+
+        return juce::jmin (scaled, 65536);
+    }
+
     int findPeakIndex (const juce::AudioBuffer<float>& impulse)
     {
         int peakIndex = 0;
@@ -151,31 +164,44 @@ int main (int argc, char* argv[])
     {
         const juce::File curveFile { juce::String (argv[3]) };
         const auto points = CurveFIR::parseCurveFile (curveFile);
-        const auto linear = CurveFIR::createLinearPhaseFIR (points, 48000.0, 8192);
-        const auto natural = CurveFIR::createMixedPhaseFIR (points, 48000.0, 4096, 0.72f, 1024);
-        const auto minimum = CurveFIR::createMinimumPhaseFIR (points, 48000.0, 4096);
-        const auto autoGainDb = juce::jlimit (-18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, 48000.0));
-
         std::cout << "Curve points: " << points.size() << "\n";
-        std::cout << "Auto gain dB: " << autoGainDb << "\n";
-        std::cout << "Linear peak: " << linear.getMagnitude (0, linear.getNumSamples()) << "\n";
-        std::cout << "Linear peak index / expected latency: " << findPeakIndex (linear) << " / 4096\n";
-        std::cout << "Linear convolution output peak index: " << measureConvolutionPeakIndex (linear, 48000.0) << "\n";
-        std::cout << "Linear error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, linear, 48000.0) << "\n";
-        std::cout << "Natural peak: " << natural.getMagnitude (0, natural.getNumSamples()) << "\n";
-        std::cout << "Natural peak index / expected latency: " << findPeakIndex (natural) << " / 1024\n";
-        std::cout << "Natural convolution output peak index: " << measureConvolutionPeakIndex (natural, 48000.0) << "\n";
-        std::cout << "Natural error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, natural, 48000.0) << "\n";
-        std::cout << "Minimum peak: " << minimum.getMagnitude (0, minimum.getNumSamples()) << "\n";
-        std::cout << "Minimum peak index / expected latency: " << findPeakIndex (minimum) << " / 0\n";
-        std::cout << "Minimum convolution output peak index: " << measureConvolutionPeakIndex (minimum, 48000.0) << "\n";
-        std::cout << "Minimum error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, minimum, 48000.0) << "\n";
 
-        const auto minResponse = CurveFIR::createMagnitudeCurveFromImpulse (minimum, 48000.0, 220);
-        for (auto frequency : { 100.0, 1000.0, 10000.0 })
-            std::cout << "Minimum " << frequency << " Hz target/actual dB: "
-                      << CurveFIR::interpolateDb (points, frequency) << " / "
-                      << CurveFIR::interpolateDb (minResponse, frequency) << "\n";
+        for (auto testSampleRate : { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
+        {
+            const auto linearTaps = scaleReferenceSamples (8192, testSampleRate);
+            const auto naturalTaps = scaleReferenceSamples (4096, testSampleRate);
+            const auto minimumTaps = scaleReferenceSamples (4096, testSampleRate);
+            const auto naturalLatency = scaleReferenceSamples (1024, testSampleRate);
+            const auto linearLatency = linearTaps / 2;
+            const auto linear = CurveFIR::createLinearPhaseFIR (points, testSampleRate, linearTaps);
+            const auto natural = CurveFIR::createMixedPhaseFIR (points, testSampleRate, naturalTaps, 0.72f, naturalLatency);
+            const auto minimum = CurveFIR::createMinimumPhaseFIR (points, testSampleRate, minimumTaps);
+            const auto autoGainDb = juce::jlimit (-18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, testSampleRate));
+
+            std::cout << "Sample rate: " << testSampleRate << "\n";
+            std::cout << "Auto gain dB: " << autoGainDb << "\n";
+            std::cout << "Linear peak: " << linear.getMagnitude (0, linear.getNumSamples()) << "\n";
+            std::cout << "Linear taps: " << linearTaps << "\n";
+            std::cout << "Linear peak index / expected latency: " << findPeakIndex (linear) << " / " << linearLatency << "\n";
+            std::cout << "Linear convolution output peak index: " << measureConvolutionPeakIndex (linear, testSampleRate) << "\n";
+            std::cout << "Linear error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, linear, testSampleRate) << "\n";
+            std::cout << "Natural peak: " << natural.getMagnitude (0, natural.getNumSamples()) << "\n";
+            std::cout << "Natural taps: " << naturalTaps << "\n";
+            std::cout << "Natural peak index / expected latency: " << findPeakIndex (natural) << " / " << naturalLatency << "\n";
+            std::cout << "Natural convolution output peak index: " << measureConvolutionPeakIndex (natural, testSampleRate) << "\n";
+            std::cout << "Natural error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, natural, testSampleRate) << "\n";
+            std::cout << "Minimum peak: " << minimum.getMagnitude (0, minimum.getNumSamples()) << "\n";
+            std::cout << "Minimum taps: " << minimumTaps << "\n";
+            std::cout << "Minimum peak index / expected latency: " << findPeakIndex (minimum) << " / 0\n";
+            std::cout << "Minimum convolution output peak index: " << measureConvolutionPeakIndex (minimum, testSampleRate) << "\n";
+            std::cout << "Minimum error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, minimum, testSampleRate) << "\n";
+
+            const auto minResponse = CurveFIR::createMagnitudeCurveFromImpulse (minimum, testSampleRate, 220);
+            for (auto frequency : { 100.0, 1000.0, 10000.0 })
+                std::cout << "Minimum " << frequency << " Hz target/actual dB: "
+                          << CurveFIR::interpolateDb (points, frequency) << " / "
+                          << CurveFIR::interpolateDb (minResponse, frequency) << "\n";
+        }
     }
 
     if (testWavFir)

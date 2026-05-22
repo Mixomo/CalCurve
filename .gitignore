@@ -13,6 +13,7 @@
 # Ready-to-copy VST3 bundle
 !CalCurve_VST3/
 !CalCurve_VST3/**
+CalCurve_VST3/**/*.locktest
 
 # Source code
 !Source/

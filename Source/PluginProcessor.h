@@ -39,6 +39,7 @@ public:
 
     void loadImpulseResponse (const juce::File& file);
     void loadCorrectionCurve (const juce::File& file);
+    bool exportCurrentFirToFile (const juce::File& file);
     bool savePresetToFile (const juce::File& file, const juce::String& presetName);
     bool loadPresetFromFile (const juce::File& file);
     juce::String getLoadedName() const;
@@ -79,6 +80,7 @@ private:
     int findImpulseResponsePeak (const juce::AudioBuffer<float>& impulse);
     int getLatencyForPhaseMode (PhaseMode mode, int taps) const;
     int getDefaultFirTapsForMode (PhaseMode mode) const;
+    int scaleReferenceSampleCount (int referenceSamples) const;
     void applyActiveLatency (int latencySamples);
     void addStoredCurveToState (juce::ValueTree& state) const;
     bool restoreStoredCurveFromState (const juce::ValueTree& state, const juce::String& fallbackName);

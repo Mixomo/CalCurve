@@ -122,46 +122,51 @@ Extract it and copy the included `CalCurve.vst3` bundle.
 The ready-to-copy VST3 bundle is included at:
 
 ```text
-Convolver_VST/CalCurve_VST3/CalCurve.vst3
+CalCurve_VST3/CalCurve.vst3
 ```
 
-On Windows, copy the full `CalCurve.vst3` bundle to your system VST3 folder:
+On Windows, copy the full `CalCurve.vst3` bundle to your DAW's VST3 scan folder.
 
-```text
-C:\Program Files\Common Files\VST3\
-```
-
-You may need administrator permission to write to that folder. After copying, rescan plugins in your DAW.
+You may need administrator permission depending on the folder you choose. After copying, rescan plugins in your DAW.
 
 ## Building
 
-CalCurve is a JUCE CMake project. JUCE is not vendored in this repository, so CMake needs to know where your local JUCE checkout is through the `JUCE_DIR` option.
+CalCurve is a JUCE CMake project. The required JUCE checkout is expected in:
+
+```text
+third_party/JUCE
+```
+
+No machine-specific library paths are required. You may still override the JUCE path with `-DJUCE_DIR=/path/to/JUCE` if you are doing local development with a separate checkout.
 
 Requirements:
 
 - CMake 3.22 or newer
 - A C++20-capable compiler
-- A local JUCE checkout
 - On Windows, Visual Studio 2022 with the MSVC C++ toolchain
+- JUCE in `third_party/JUCE`
 
 Example folder layout:
 
 ```text
-C:\Dev\
-  CalCurve\
-  JUCE\
+CalCurve/
+  CMakeLists.txt
+  Source/
+  tools/
+  third_party/
+    JUCE/
 ```
 
-From the `CalCurve` repository folder, configure the build with a generic local JUCE path:
+From the `CalCurve` repository folder, configure the build:
 
 ```powershell
-cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"" -arch=x64 && cmake -S . -B build -G ""NMake Makefiles"" -DJUCE_DIR=""C:\Dev\JUCE"" -DCMAKE_BUILD_TYPE=Release"
+cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
 ```
 
 Build the VST3 plugin and the smoke test executable:
 
 ```powershell
-cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"" -arch=x64 && cmake --build build --target CalCurve_VST3 CalCurveVST3SmokeTest"
+cmake --build build --target CalCurve_VST3 CalCurveVST3SmokeTest
 ```
 
 What the configure command does:
@@ -169,7 +174,6 @@ What the configure command does:
 - `-S .` uses the current repository as the source directory.
 - `-B build` writes all generated CMake/build files to `build`.
 - `-G "NMake Makefiles"` selects the NMake generator.
-- `-DJUCE_DIR="C:\Dev\JUCE"` points CMake to your JUCE checkout. Replace this with your own JUCE path.
 - `-DCMAKE_BUILD_TYPE=Release` creates a Release build.
 
 What the build command does:
@@ -230,7 +234,7 @@ Curve/FIR phase validation using a generic local TXT or CSV correction curve:
 ```powershell
 .\build\CalCurveVST3SmokeTest_artefacts\Release\CalCurveVST3SmokeTest.exe `
   .\build\CalCurve_artefacts\Release\VST3\CalCurve.vst3 `
-  --fir-test "C:\Path\To\Your\CalibrationCurve.txt"
+  --fir-test "<path-to-your-calibration-curve.txt>"
 ```
 
 You can replace the last path with any supported TXT or CSV correction curve.
@@ -249,7 +253,7 @@ Inspect a WAV FIR file:
 ```powershell
 .\build\CalCurveVST3SmokeTest_artefacts\Release\CalCurveVST3SmokeTest.exe `
   .\build\CalCurve_artefacts\Release\VST3\CalCurve.vst3 `
-  --wav-fir-test "C:\Path\To\Your\ImpulseResponse.wav"
+  --wav-fir-test "<path-to-your-impulse-response.wav>"
 ```
 
 This reads a WAV impulse response, extracts its magnitude curve, estimates Auto Gain, and reports basic FIR information.

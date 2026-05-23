@@ -6,10 +6,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT DEFINED JUCE_DIR)
-    message(FATAL_ERROR "Set JUCE_DIR to a local JUCE checkout, for example -DJUCE_DIR=C:/JUCE")
+    set(JUCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/JUCE")
 endif()
 
-add_subdirectory("${JUCE_DIR}" JUCE)
+if(NOT EXISTS "${JUCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "JUCE was not found. Expected it at third_party/JUCE, or pass -DJUCE_DIR=/path/to/JUCE.")
+endif()
+
+add_subdirectory("${JUCE_DIR}" "${CMAKE_BINARY_DIR}/third_party/JUCE")
 
 juce_add_plugin(CalCurve
     COMPANY_NAME "Mixomo"

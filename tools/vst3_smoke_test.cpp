@@ -116,7 +116,13 @@ int main (int argc, char* argv[])
 
     const auto pluginPath = argc > 1
         ? juce::String (argv[1])
-        : juce::String ("J:\\Convolver_VST\\build\\CalCurve_artefacts\\Release\\VST3\\CalCurve.vst3");
+        : juce::File::getCurrentWorkingDirectory()
+              .getChildFile ("build")
+              .getChildFile ("CalCurve_artefacts")
+              .getChildFile ("Release")
+              .getChildFile ("VST3")
+              .getChildFile ("CalCurve.vst3")
+              .getFullPathName();
 
     std::cout << "Plugin: " << pluginPath << "\n";
 

@@ -10,6 +10,11 @@
 !README.md
 !THIRD_PARTY_NOTICES.md
 
+# Vendored build dependencies
+!third_party/
+!third_party/JUCE/
+!third_party/JUCE/**
+
 # Ready-to-copy VST3 bundle
 !CalCurve_VST3/
 !CalCurve_VST3/**

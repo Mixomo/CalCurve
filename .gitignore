@@ -1,5 +1,8 @@
 *
 
+# Local master build tree. Keep it for development; never publish it.
+_build_verify/
+
 # Repository metadata
 !.gitignore
 !.gitattributes
@@ -9,35 +12,36 @@
 !LICENSE
 !README.md
 !THIRD_PARTY_NOTICES.md
+!assets/
+!assets/**
 
 # Vendored build dependencies
 !third_party/
 !third_party/JUCE/
-!third_party/JUCE/**
+!third_party/JUCE/CMakeLists.txt
+!third_party/JUCE/LICENSE.md
+!third_party/JUCE/README.md
+!third_party/JUCE/modules/
+!third_party/JUCE/modules/**
+!third_party/JUCE/extras/
+!third_party/JUCE/extras/Build/
+!third_party/JUCE/extras/Build/**
 
 # Ready-to-copy VST3 bundle
-!CalCurve_VST3/
-!CalCurve_VST3/**
-CalCurve_VST3/**/*.locktest
+!FlexCurve_VST3/
+!FlexCurve_VST3/**
+FlexCurve_VST3/**/*.locktest
 
 # Source code
 !Source/
 !Source/CurveFIR.h
 !Source/CurveFIR.cpp
-!Source/PluginEditor.h
-!Source/PluginEditor.cpp
-!Source/PluginProcessor.h
-!Source/PluginProcessor.cpp
-
-# Build helper files
-!cmake/
-!cmake/*.cmake
+!Source/FlexCurveEditor.h
+!Source/FlexCurveEditor.cpp
+!Source/FlexCurveProcessor.h
+!Source/FlexCurveProcessor.cpp
 
 # Tools and tests
 !tools/
-!tools/*.py
-!tools/*.cpp
-
-# Assets
-!assets/
-!assets/VST_GUI.png
+!tools/vst3_smoke_test.cpp
+!tools/flexcurve_engine_test.cpp

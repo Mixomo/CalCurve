@@ -70,10 +70,15 @@ namespace
         return band.frequency > 0.0 && band.q > 0.0 && std::isfinite (band.gainDb);
     }
 
-    double parsePreamp (const juce::String& line)
+    bool parseGlobalGainDirective (const juce::String& sourceLine, double& gainDb)
     {
-        if (! line.containsIgnoreCase ("Preamp"))
-            return 0.0;
+        const auto line = sourceLine.trim();
+        const auto isGainDirective = line.startsWithIgnoreCase ("Preamp")
+                                  || line.startsWithIgnoreCase ("Global Gain")
+                                  || line.startsWithIgnoreCase ("Gain:");
+
+        if (! isGainDirective || line.containsIgnoreCase ("Filter"))
+            return false;
 
         juce::StringArray tokens;
         tokens.addTokens (line.replaceCharacter (':', ' '), " \t", "");
@@ -81,12 +86,19 @@ namespace
 
         for (const auto& token : tokens)
         {
-            const auto value = token.getDoubleValue();
-            if (std::abs (value) > 0.0001)
-                return value;
+            const auto numeric = token.retainCharacters ("+-0123456789.eE");
+            if (numeric.isNotEmpty() && numeric.containsAnyOf ("0123456789"))
+            {
+                const auto value = numeric.getDoubleValue();
+                if (std::isfinite (value))
+                {
+                    gainDb = value;
+                    return true;
+                }
+            }
         }
 
-        return 0.0;
+        return false;
     }
 
     double biquadMagnitudeDb (const ParametricBand& band, double frequency, double sampleRate)
@@ -165,10 +177,36 @@ std::vector<CurvePoint> CurveFIR::parseCurveFile (const juce::File& file)
 
 std::vector<CurvePoint> CurveFIR::parseCurveText (const juce::String& sourceText)
 {
-    std::vector<CurvePoint> points;
+    auto parsed = parseCurveTextWithGain (sourceText);
+    if (parsed.hasExplicitGain)
+        for (auto& point : parsed.points)
+            point.db += parsed.gainDb;
+    return parsed.points;
+}
+
+ParsedCurveData CurveFIR::parseCurveFileWithGain (const juce::File& file)
+{
+    return parseCurveTextWithGain (file.loadFileAsString());
+}
+
+ParsedCurveData CurveFIR::parseCurveTextWithGain (const juce::String& sourceText)
+{
+    ParsedCurveData result;
+    auto& points = result.points;
     auto text = sourceText;
     std::vector<ParametricBand> bands;
-    double preamp = 0.0;
+
+    juce::StringArray sourceLines;
+    sourceLines.addLines (sourceText);
+    for (const auto& line : sourceLines)
+    {
+        double gain = 0.0;
+        if (parseGlobalGainDirective (line, gain))
+        {
+            result.gainDb += gain;
+            result.hasExplicitGain = true;
+        }
+    }
 
     if (text.containsIgnoreCase ("GraphicEQ:"))
     {
@@ -197,8 +235,6 @@ std::vector<CurvePoint> CurveFIR::parseCurveText (const juce::String& sourceText
             ParametricBand band;
             if (parseParametricLine (line, band))
                 bands.push_back (band);
-
-            preamp += parsePreamp (line);
         }
     }
 
@@ -209,7 +245,7 @@ std::vector<CurvePoint> CurveFIR::parseCurveText (const juce::String& sourceText
         {
             const auto alpha = static_cast<double> (i) / 239.0;
             const auto frequency = 20.0 * std::pow (1000.0, alpha);
-            double db = preamp;
+            double db = 0.0;
 
             for (const auto& band : bands)
                 db += biquadMagnitudeDb (band, frequency, 48000.0);
@@ -244,7 +280,7 @@ std::vector<CurvePoint> CurveFIR::parseCurveText (const juce::String& sourceText
         });
     }
 
-    return points;
+    return result;
 }
 
 juce::AudioBuffer<float> CurveFIR::createLinearPhaseFIR (const std::vector<CurvePoint>& points,

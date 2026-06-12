@@ -14,13 +14,13 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 
 Website: https://juce.com/
 
-JUCE is the C++ application/audio plugin framework used by CalCurve. JUCE is available under AGPLv3/commercial licensing.
+JUCE is the C++ application/audio plugin framework used by FlexCurve. JUCE is available under AGPLv3/commercial licensing.
 
 ## Microsoft MSVC / Visual Studio C++ Toolchain
 
 Website: https://visualstudio.microsoft.com/
 
-CalCurve's Windows binaries were built with Microsoft's MSVC C++ compiler/toolchain.
+FlexCurve's Windows binaries were built with Microsoft's MSVC C++ compiler/toolchain.
 
 ## C++
 

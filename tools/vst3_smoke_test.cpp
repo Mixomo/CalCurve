@@ -98,7 +98,7 @@ class SmokeWindow final : public juce::DocumentWindow
 {
 public:
     SmokeWindow()
-        : DocumentWindow ("CalCurve VST3 Smoke Test",
+        : DocumentWindow ("FlexCurve VST3 Smoke Test",
                           juce::Colours::black,
                           DocumentWindow::closeButton)
     {
@@ -118,10 +118,10 @@ int main (int argc, char* argv[])
         ? juce::String (argv[1])
         : juce::File::getCurrentWorkingDirectory()
               .getChildFile ("build")
-              .getChildFile ("CalCurve_artefacts")
+              .getChildFile ("FlexCurve_artefacts")
               .getChildFile ("Release")
               .getChildFile ("VST3")
-              .getChildFile ("CalCurve.vst3")
+              .getChildFile ("FlexCurve.vst3")
               .getFullPathName();
 
     std::cout << "Plugin: " << pluginPath << "\n";
@@ -182,10 +182,11 @@ int main (int argc, char* argv[])
             const auto linear = CurveFIR::createLinearPhaseFIR (points, testSampleRate, linearTaps);
             const auto natural = CurveFIR::createMixedPhaseFIR (points, testSampleRate, naturalTaps, 0.72f, naturalLatency);
             const auto minimum = CurveFIR::createMinimumPhaseFIR (points, testSampleRate, minimumTaps);
-            const auto autoGainDb = juce::jlimit (-18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, testSampleRate));
+            const auto kWeightedCurveEstimateDb = juce::jlimit (
+                -18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, testSampleRate));
 
             std::cout << "Sample rate: " << testSampleRate << "\n";
-            std::cout << "Auto gain dB: " << autoGainDb << "\n";
+            std::cout << "K-weighted curve estimate dB: " << kWeightedCurveEstimateDb << "\n";
             std::cout << "Linear peak: " << linear.getMagnitude (0, linear.getNumSamples()) << "\n";
             std::cout << "Linear taps: " << linearTaps << "\n";
             std::cout << "Linear peak index / expected latency: " << findPeakIndex (linear) << " / " << linearLatency << "\n";
@@ -224,12 +225,13 @@ int main (int argc, char* argv[])
             reader->read (&impulse, 0, impulse.getNumSamples(), 0, true, true);
 
             const auto points = CurveFIR::createMagnitudeCurveFromImpulse (impulse, reader->sampleRate);
-            const auto autoGainDb = juce::jlimit (-18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, reader->sampleRate));
+            const auto kWeightedCurveEstimateDb = juce::jlimit (
+                -18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, reader->sampleRate));
 
             std::cout << "WAV samples: " << impulse.getNumSamples() << "\n";
             std::cout << "WAV channels: " << impulse.getNumChannels() << "\n";
             std::cout << "WAV curve points: " << points.size() << "\n";
-            std::cout << "WAV auto gain dB: " << autoGainDb << "\n";
+            std::cout << "WAV K-weighted curve estimate dB: " << kWeightedCurveEstimateDb << "\n";
             std::cout << "WAV magnitude error dB: " << CurveFIR::calculateMagnitudeErrorDb (points, impulse, reader->sampleRate) << "\n";
         }
         else
@@ -245,7 +247,7 @@ int main (int argc, char* argv[])
         instance->getStateInformation (data);
 
         const auto tempFile = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                                  .getChildFile ("CalCurveSmokeTest.calcurvepreset");
+                                  .getChildFile ("FlexCurveSmokeTest.flexcurvepreset");
 
         if (! tempFile.replaceWithData (data.getData(), data.getSize()))
         {

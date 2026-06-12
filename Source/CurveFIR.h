@@ -10,11 +10,20 @@ struct CurvePoint
     double db = 0.0;
 };
 
+struct ParsedCurveData
+{
+    std::vector<CurvePoint> points;
+    double gainDb = 0.0;
+    bool hasExplicitGain = false;
+};
+
 class CurveFIR
 {
 public:
     static std::vector<CurvePoint> parseCurveFile (const juce::File& file);
     static std::vector<CurvePoint> parseCurveText (const juce::String& text);
+    static ParsedCurveData parseCurveFileWithGain (const juce::File& file);
+    static ParsedCurveData parseCurveTextWithGain (const juce::String& text);
 
     static juce::AudioBuffer<float> createLinearPhaseFIR (const std::vector<CurvePoint>& points,
                                                           double sampleRate,

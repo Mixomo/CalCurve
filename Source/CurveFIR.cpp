@@ -40,6 +40,30 @@ namespace
         return true;
     }
 
+    bool parseStereoTriple (const juce::String& text, CurvePoint& left, CurvePoint& right)
+    {
+        auto cleaned = text.trim()
+                           .replaceCharacter (',', ' ')
+                           .replaceCharacter (';', ' ')
+                           .replaceCharacter ('\t', ' ');
+        juce::StringArray tokens;
+        tokens.addTokens (cleaned, " ", "");
+        tokens.removeEmptyStrings();
+        if (tokens.size() < 3)
+            return false;
+
+        const auto frequency = tokens[0].getDoubleValue();
+        const auto leftDb = tokens[1].getDoubleValue();
+        const auto rightDb = tokens[2].getDoubleValue();
+        if (frequency <= 0.0 || ! std::isfinite (frequency)
+            || ! std::isfinite (leftDb) || ! std::isfinite (rightDb))
+            return false;
+
+        left = { frequency, leftDb };
+        right = { frequency, rightDb };
+        return true;
+    }
+
     bool parseParametricLine (const juce::String& line, ParametricBand& band)
     {
         if (! line.containsIgnoreCase ("Filter") || ! line.containsIgnoreCase ("Fc"))
@@ -75,7 +99,9 @@ namespace
         const auto line = sourceLine.trim();
         const auto isGainDirective = line.startsWithIgnoreCase ("Preamp")
                                   || line.startsWithIgnoreCase ("Global Gain")
-                                  || line.startsWithIgnoreCase ("Gain:");
+                                  || line.startsWithIgnoreCase ("Gain:")
+                                  || line.startsWithIgnoreCase ("Left Gain")
+                                  || line.startsWithIgnoreCase ("Right Gain");
 
         if (! isGainDirective || line.containsIgnoreCase ("Filter"))
             return false;
@@ -203,8 +229,25 @@ ParsedCurveData CurveFIR::parseCurveTextWithGain (const juce::String& sourceText
         double gain = 0.0;
         if (parseGlobalGainDirective (line, gain))
         {
-            result.gainDb += gain;
-            result.hasExplicitGain = true;
+            const auto explicitlyRight = line.startsWithIgnoreCase ("Preamp R")
+                                      || line.startsWithIgnoreCase ("Right Gain");
+            const auto explicitlyLeft = line.startsWithIgnoreCase ("Preamp L")
+                                     || line.startsWithIgnoreCase ("Left Gain");
+            if (explicitlyRight)
+            {
+                result.rightGainDb += gain;
+                result.hasExplicitRightGain = true;
+                result.hasIndependentRightChannel = true;
+            }
+            else
+            {
+                result.gainDb += gain;
+                result.hasExplicitGain = true;
+                if (explicitlyLeft)
+                    result.hasIndependentRightChannel = true;
+                else
+                    result.rightGainDb += gain;
+            }
         }
     }
 
@@ -216,9 +259,18 @@ ParsedCurveData CurveFIR::parseCurveTextWithGain (const juce::String& sourceText
 
         for (const auto& chunk : chunks)
         {
-            CurvePoint point;
-            if (parsePair (chunk, point))
-                points.push_back (point);
+            CurvePoint leftPoint;
+            CurvePoint rightPoint;
+            if (parseStereoTriple (chunk, leftPoint, rightPoint))
+            {
+                points.push_back (leftPoint);
+                result.rightPoints.push_back (rightPoint);
+                result.hasIndependentRightChannel = true;
+            }
+            else if (parsePair (chunk, leftPoint))
+            {
+                points.push_back (leftPoint);
+            }
         }
     }
     else
@@ -228,9 +280,18 @@ ParsedCurveData CurveFIR::parseCurveTextWithGain (const juce::String& sourceText
 
         for (const auto& line : lines)
         {
-            CurvePoint point;
-            if (parsePair (line, point))
-                points.push_back (point);
+            CurvePoint leftPoint;
+            CurvePoint rightPoint;
+            if (parseStereoTriple (line, leftPoint, rightPoint))
+            {
+                points.push_back (leftPoint);
+                result.rightPoints.push_back (rightPoint);
+                result.hasIndependentRightChannel = true;
+            }
+            else if (parsePair (line, leftPoint))
+            {
+                points.push_back (leftPoint);
+            }
 
             ParametricBand band;
             if (parseParametricLine (line, band))
@@ -263,6 +324,23 @@ ParsedCurveData CurveFIR::parseCurveTextWithGain (const juce::String& sourceText
     {
         return juce::approximatelyEqual (a.frequency, b.frequency);
     }), points.end());
+
+    std::sort (result.rightPoints.begin(), result.rightPoints.end(), [] (const auto& a, const auto& b)
+    {
+        return a.frequency < b.frequency;
+    });
+    result.rightPoints.erase (std::unique (result.rightPoints.begin(), result.rightPoints.end(),
+                                           [] (const auto& a, const auto& b)
+                                           {
+                                               return juce::approximatelyEqual (a.frequency, b.frequency);
+                                           }),
+                              result.rightPoints.end());
+
+    if (! result.hasIndependentRightChannel)
+    {
+        result.rightPoints = points;
+        result.rightGainDb = result.gainDb;
+    }
 
     if (points.size() > 2 && points.back().frequency <= 5.0)
     {

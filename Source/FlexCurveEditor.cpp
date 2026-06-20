@@ -1,5 +1,6 @@
 #include "FlexCurveEditor.h"
 #include <limits>
+#include <numeric>
 
 namespace
 {
@@ -8,6 +9,15 @@ namespace
     juce::Colour inkColour() { return juce::Colour (0xffeff5f3); }
     juce::Colour mutedColour() { return juce::Colour (0xff9eabb8); }
     juce::Colour accentColour() { return juce::Colour (0xff27d7a4); }
+    juce::Colour scrollThumbColour() { return accentColour().darker (0.42f).withAlpha (0.85f); }
+    juce::Colour scrollTrackColour() { return juce::Colour (0xff111820); }
+
+    void styleScrollBar (juce::ScrollBar& scrollBar)
+    {
+        scrollBar.setColour (juce::ScrollBar::thumbColourId, scrollThumbColour());
+        scrollBar.setColour (juce::ScrollBar::trackColourId, scrollTrackColour());
+        scrollBar.setColour (juce::ScrollBar::backgroundColourId, juce::Colours::transparentBlack);
+    }
 
     juce::String frequencyLabel (double hz)
     {
@@ -23,19 +33,57 @@ namespace
         return juce::String (juce::roundToInt (hz));
     }
 
-    std::vector<CurvePoint> graphScalePointsFor (FlexCurveAudioProcessor& processor)
+    bool curvesDiffer (const std::vector<CurvePoint>& left,
+                       const std::vector<CurvePoint>& right,
+                       double toleranceDb = 1.0e-4)
+    {
+        if (left.size() != right.size())
+            return true;
+        for (size_t i = 0; i < left.size(); ++i)
+            if (std::abs (left[i].db - right[i].db) > toleranceDb)
+                return true;
+        return false;
+    }
+
+    float displayBalanceOffsetDb (FlexCurveAudioProcessor& processor, FlexChannelSelection channel)
+    {
+        const auto balanceDb = processor.parameters.getRawParameterValue ("globalbalance")->load();
+        const auto limited = juce::jlimit (-24.0f, 24.0f, balanceDb);
+        return channel == FlexChannelSelection::right ? limited * 0.5f : -limited * 0.5f;
+    }
+
+    float balanceDbToPanPercent (float balanceDb)
+    {
+        return juce::jlimit (-100.0f, 100.0f, balanceDb * (100.0f / 24.0f));
+    }
+
+    float panPercentToBalanceDb (float panPercent)
+    {
+        return juce::jlimit (-24.0f, 24.0f, panPercent * (24.0f / 100.0f));
+    }
+
+    void applyDisplayAudioTransform (FlexCurveAudioProcessor& processor,
+                                     std::vector<CurvePoint>& points,
+                                     FlexChannelSelection channel)
     {
         const auto dryWet = processor.parameters.getRawParameterValue ("drywet")->load();
         const auto gainDb = processor.parameters.getRawParameterValue ("gain")->load();
         const auto bypassed = processor.parameters.getRawParameterValue ("bypass")->load() > 0.5f;
-        auto displayAudioCurve = [dryWet, gainDb, bypassed] (std::vector<CurvePoint> points)
+        const auto balanceOffset = displayBalanceOffsetDb (processor, channel);
+        for (auto& point : points)
+            point.db = bypassed ? 0.0 : point.db * dryWet + gainDb + balanceOffset;
+    }
+
+    std::vector<CurvePoint> graphScalePointsFor (FlexCurveAudioProcessor& processor)
+    {
+        auto displayAudioCurve = [&processor] (std::vector<CurvePoint> points,
+                                                FlexChannelSelection channel)
         {
-            for (auto& point : points)
-                point.db = bypassed ? 0.0 : point.db * dryWet + gainDb;
+            applyDisplayAudioTransform (processor, points, channel);
             return points;
         };
 
-        auto points = displayAudioCurve (processor.getFinalCurve());
+        auto points = displayAudioCurve (processor.getFinalCurve(), FlexChannelSelection::left);
         const auto layers = processor.getLayers();
         for (const auto& layer : layers)
         {
@@ -44,21 +92,44 @@ namespace
             if (processor.isLayerTypeVisible (layer.type))
             {
                 const auto curve = layer.type == FlexCurveLayerType::eq
-                    ? displayAudioCurve (processor.getLayerCurve (layer.id))
+                    ? displayAudioCurve (processor.getLayerCurve (layer.id), FlexChannelSelection::left)
                     : processor.getLayerCurveForDisplay (layer.id);
                 points.insert (points.end(), curve.begin(), curve.end());
+                if (! layer.channelsLinked)
+                {
+                    const auto rightCurve = layer.type == FlexCurveLayerType::eq
+                        ? displayAudioCurve (processor.getLayerCurve (
+                            layer.id, FlexChannelSelection::right), FlexChannelSelection::right)
+                        : processor.getLayerCurveForDisplay (
+                            layer.id, FlexChannelSelection::right);
+                    points.insert (points.end(), rightCurve.begin(), rightCurve.end());
+                }
             }
             if (processor.areCorrectedMeasurementsVisible()
                 && layer.type == FlexCurveLayerType::eq && layer.autoEqRawLayerId > 0)
             {
                 const auto corrected = processor.getCorrectedMeasurementCurve (layer.id);
                 points.insert (points.end(), corrected.begin(), corrected.end());
+                if (! layer.channelsLinked)
+                {
+                    const auto correctedRight = processor.getCorrectedMeasurementCurve (
+                        layer.id, FlexChannelSelection::right);
+                    points.insert (points.end(), correctedRight.begin(), correctedRight.end());
+                }
             }
         }
         if (processor.isAverageVisible())
         {
-            const auto average = displayAudioCurve (processor.getAverageCurve());
+            const auto average = displayAudioCurve (processor.getAverageCurve(), FlexChannelSelection::left);
             points.insert (points.end(), average.begin(), average.end());
+            if (processor.averageChannelsDiffer()
+                || std::abs (processor.parameters.getRawParameterValue ("globalbalance")->load()) > 0.001f)
+            {
+                const auto rightAverage = displayAudioCurve (
+                    processor.getAverageCurve (FlexChannelSelection::right),
+                    FlexChannelSelection::right);
+                points.insert (points.end(), rightAverage.begin(), rightAverage.end());
+            }
         }
         for (const auto type : { FlexCurveLayerType::target, FlexCurveLayerType::raw })
         {
@@ -70,21 +141,23 @@ namespace
             });
             if (count >= 2)
             {
-                const auto average = processor.getAverageCurveForTypeForDisplay (type);
-                points.insert (points.end(), average.begin(), average.end());
+                const auto averageLeft = processor.getAverageCurveForTypeForDisplay (
+                    type, FlexChannelSelection::left);
+                const auto averageRight = processor.getAverageCurveForTypeForDisplay (
+                    type, FlexChannelSelection::right);
+                points.insert (points.end(), averageLeft.begin(), averageLeft.end());
+                if (curvesDiffer (averageLeft, averageRight))
+                    points.insert (points.end(), averageRight.begin(), averageRight.end());
             }
         }
         return points;
     }
 
     std::vector<CurvePoint> graphDisplayAudioCurveFor (FlexCurveAudioProcessor& processor,
-                                                        std::vector<CurvePoint> points)
+                                                        std::vector<CurvePoint> points,
+                                                        FlexChannelSelection channel = FlexChannelSelection::left)
     {
-        const auto dryWet = processor.parameters.getRawParameterValue ("drywet")->load();
-        const auto gainDb = processor.parameters.getRawParameterValue ("gain")->load();
-        const auto bypassed = processor.parameters.getRawParameterValue ("bypass")->load() > 0.5f;
-        for (auto& point : points)
-            point.db = bypassed ? 0.0 : point.db * dryWet + gainDb;
+        applyDisplayAudioTransform (processor, points, channel);
         return points;
     }
 
@@ -115,6 +188,171 @@ namespace
         button.setColour (juce::ToggleButton::tickColourId, accentColour());
     }
 
+    class CrossfeedAdvancedComponent final : public juce::Component
+    {
+    public:
+        explicit CrossfeedAdvancedComponent (FlexCurveAudioProcessor& p) : processor (p)
+        {
+            algorithm.addItem ("Natural", 1);
+            algorithm.addItem ("BS2B / RME style", 2);
+            styleCombo (algorithm);
+            addAndMakeVisible (algorithm);
+
+            preset.addItem ("Average Male", 1);
+            preset.addItem ("Average Female", 2);
+            preset.addItem ("Wide / relaxed", 3);
+            preset.addItem ("Narrow / strong", 4);
+            preset.setTextWhenNothingSelected ("Geometry preset...");
+            styleCombo (preset);
+            preset.onChange = [this] { applyPreset (preset.getSelectedId()); };
+            addAndMakeVisible (preset);
+
+            addSlider (circumference, " cm", "Head Circumference");
+            addSlider (headWidth, " cm", "Head Width");
+            addSlider (headLength, " cm", "Head Length");
+            addSlider (angle, juce::String::fromUTF8 (" \xc2\xb0"), "Speaker Angle");
+            addSlider (cutoff, " Hz", "Crossfeed Cutoff");
+            addSlider (direct, " %", "Direct Level");
+
+            reset.setButtonText ("Reset");
+            styleButton (reset);
+            reset.onClick = [this] { resetDefaults(); };
+            addAndMakeVisible (reset);
+
+            algorithmAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (
+                processor.parameters, "crossfeedalgorithm", algorithm);
+            circumferenceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.parameters, "crossfeedcircumference", circumference);
+            widthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.parameters, "crossfeedheadwidth", headWidth);
+            lengthAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.parameters, "crossfeedheadlength", headLength);
+            angleAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.parameters, "crossfeedangle", angle);
+            cutoffAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.parameters, "crossfeedcutoff", cutoff);
+            directAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                processor.parameters, "crossfeeddirect", direct);
+
+            setSize (420, 330);
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (panelColour());
+            g.setColour (inkColour());
+            g.setFont (juce::FontOptions (18.0f, juce::Font::bold));
+            g.drawText ("Advanced Crossfeed", getLocalBounds().removeFromTop (38).reduced (14, 0),
+                        juce::Justification::centredLeft);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced (16, 44);
+            auto top = area.removeFromTop (30);
+            algorithm.setBounds (top.removeFromLeft (180));
+            top.removeFromLeft (10);
+            preset.setBounds (top.removeFromLeft (190));
+            area.removeFromTop (10);
+
+            auto place = [&area] (juce::Label& label, juce::Slider& slider)
+            {
+                auto row = area.removeFromTop (36);
+                label.setBounds (row.removeFromLeft (142));
+                slider.setBounds (row);
+                area.removeFromTop (5);
+            };
+
+            place (circumferenceLabel, circumference);
+            place (headWidthLabel, headWidth);
+            place (headLengthLabel, headLength);
+            place (angleLabel, angle);
+            place (cutoffLabel, cutoff);
+            place (directLabel, direct);
+            reset.setBounds (area.removeFromTop (32).removeFromRight (96));
+        }
+
+    private:
+        void addSlider (juce::Slider& slider, const juce::String& suffix, const juce::String& labelText)
+        {
+            slider.setSliderStyle (juce::Slider::LinearHorizontal);
+            slider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 74, 22);
+            slider.setTextValueSuffix (suffix);
+            slider.setColour (juce::Slider::thumbColourId, accentColour());
+            slider.setColour (juce::Slider::trackColourId, juce::Colour (0xff33404c));
+            slider.setColour (juce::Slider::textBoxTextColourId, inkColour());
+            slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+            addAndMakeVisible (slider);
+
+            auto* label = labelFor (slider);
+            label->setText (labelText, juce::dontSendNotification);
+            label->setColour (juce::Label::textColourId, inkColour());
+            label->setJustificationType (juce::Justification::centredLeft);
+            addAndMakeVisible (*label);
+        }
+
+        juce::Label* labelFor (juce::Slider& slider)
+        {
+            if (&slider == &circumference) return &circumferenceLabel;
+            if (&slider == &headWidth) return &headWidthLabel;
+            if (&slider == &headLength) return &headLengthLabel;
+            if (&slider == &angle) return &angleLabel;
+            if (&slider == &cutoff) return &cutoffLabel;
+            return &directLabel;
+        }
+
+        void setChoice (const juce::String& id, int index)
+        {
+            if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (processor.parameters.getParameter (id)))
+                ranged->setValueNotifyingHost (ranged->convertTo0to1 (static_cast<float> (index)));
+        }
+
+        void setFloat (const juce::String& id, float value)
+        {
+            if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (processor.parameters.getParameter (id)))
+                ranged->setValueNotifyingHost (ranged->convertTo0to1 (value));
+        }
+
+        void applyGeometry (float circumferenceCm, float widthCm, float lengthCm,
+                            float speakerAngle, float cutoffHz, float directPercent)
+        {
+            setFloat ("crossfeedcircumference", circumferenceCm);
+            setFloat ("crossfeedheadwidth", widthCm);
+            setFloat ("crossfeedheadlength", lengthCm);
+            setFloat ("crossfeedangle", speakerAngle);
+            setFloat ("crossfeedcutoff", cutoffHz);
+            setFloat ("crossfeeddirect", directPercent);
+        }
+
+        void applyPreset (int id)
+        {
+            if (id == 1) applyGeometry (57.0f, 15.0f, 19.0f, 60.0f, 700.0f, 100.0f);
+            else if (id == 2) applyGeometry (54.0f, 14.0f, 18.0f, 60.0f, 760.0f, 100.0f);
+            else if (id == 3) applyGeometry (61.0f, 17.0f, 21.0f, 75.0f, 650.0f, 105.0f);
+            else if (id == 4) applyGeometry (52.0f, 13.0f, 17.0f, 45.0f, 950.0f, 95.0f);
+        }
+
+        void resetDefaults()
+        {
+            setChoice ("crossfeedalgorithm", 0);
+            applyGeometry (57.0f, 15.0f, 19.0f, 60.0f, 700.0f, 100.0f);
+            preset.setSelectedId (1, juce::dontSendNotification);
+        }
+
+        FlexCurveAudioProcessor& processor;
+        juce::ComboBox algorithm, preset;
+        juce::Slider circumference, headWidth, headLength, angle, cutoff, direct;
+        juce::Label circumferenceLabel, headWidthLabel, headLengthLabel, angleLabel, cutoffLabel, directLabel;
+        juce::TextButton reset;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> algorithmAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> circumferenceAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> widthAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lengthAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> angleAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> cutoffAttachment;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> directAttachment;
+    };
+
     juce::String flexCurveHelpText()
     {
         return
@@ -127,17 +365,27 @@ namespace
             "- Equalizer APO / Wavelet GraphicEQ text\n"
             "- APO CSV correction curves\n"
             "- Melda FreeForm EQ CSV exports\n"
-            "- Equalizer APO parametric EQ text\n\n"
+            "- Equalizer APO parametric EQ text\n"
+            "- Stereo frequency/left dB/right dB rows and separate L/R gain directives\n\n"
             "LAYERS AND BLEND\n\n"
             "- Import Curve as a New Layer loads CSV, TXT, or WAV FIR.\n"
             "- Explicit Preamp/global gain from text curves is separated into the layer Gain slider instead of being hidden in curve points. FlexCurve FIR exports preserve that gain in WAV metadata; external FIRs without explicit metadata keep their measured response and default to 0.0 dB layer gain.\n"
             "- Add Curve as a New Layer creates a flat editable layer.\n"
             "- Up to six user layers can coexist. Each has an embedded source curve, color, custom name, visibility, mute, solo, gain, Blend settings, Graphic/Variable EQ, and Parametric EQ.\n"
+            "- EQ layers also have a Balance control. It applies a differential L/R dB offset to that layer's correction, so headphone channel-balance fixes are visible, audible, rendered, exported, and saved in presets.\n"
             "- Clone duplicates a layer's embedded curve, EQ banks, Variable points, Parametric filters, Blend, smoothing, inversion, and visibility state under a new name and color.\n"
             "- The persistent color rack is available in every tab: V controls graph visibility, M excludes a layer from audio and Average, and S restricts audio and Average to soloed layers. Click the color circle to make that layer active.\n"
             "- Average is the read-only white result derived live from audible layers and is used by preview and Render FIR.\n"
             "- Per Layer Blend applies Bass, Mid, Treble, and crossover settings to the active EQ layer. Global Blend keeps a separate regional-trim state and applies it to all EQ layers. Layer Gain always remains an independent per-layer control.\n"
             "- Invert reverses a layer correction around 0 dB.\n\n"
+            "STEREO L/R LAYERS\n\n"
+            "- Every layer stores independent Left and Right source geometry, gain, Blend, Graphic/Variable EQ, Parametric EQ, smoothing, inversion, normalization, and AutoEQ reference state.\n"
+            "- Mono imports and new flat layers start Linked L+R. Stereo WAV FIRs and frequency/left dB/right dB text curves preserve independent channels.\n"
+            "- Select L, R, or L+R from a layer row or the persistent rack. Clicking an L/R graph legend also selects that channel.\n"
+            "- Editing only L or R splits a linked layer without changing the other side. L+R applies the next edit to both sides but does not silently relink an already split layer.\n"
+            "- Link is explicit: it copies the currently selected side to both channels and returns the layer to Linked L+R.\n"
+            "- Split channels use darker/lighter variants of the layer colour and remain independent through Average, Tracking, preview, FIR render, presets, and export.\n"
+            "- AutoEQ uses a shared safe preamp based on the larger L/R peak by default, preserving stereo balance. Independent L/R AutoEQ Preamp is an advanced option that may intentionally alter channel balance.\n\n"
             "GRAPHIC AND VARIABLE EQ\n\n"
             "- Graphic EQ provides editable 15-band and 31-band modes.\n"
             "- The 15-band and 31-band modes have independent gain banks. Switching modes never reinterprets or overwrites the other mode's faders.\n"
@@ -146,6 +394,7 @@ namespace
             "- Variable editing and processing are enabled only while Graphic EQ is enabled and Variable mode is selected. Switching to 15/31 bands bypasses stored Variable points unless Preserve Variable Shape is enabled explicitly.\n"
             "- Smooth Curve applies non-destructive smoothing to the active layer's Graphic/Variable contribution. Smooth All Layers enables smoothing across the project.\n"
             "- Copy EQ, Paste EQ, and Paste Inverted EQ work within the same layer or across layers. 15-band EQ can paste into 15, 31, or Variable mode; 31-band EQ can paste into 31 or Variable; Variable EQ can paste only into Variable mode. Ctrl-click toggles individual fixed bands, Shift-click selects a continuous range, and double-click resets the selected bands to 0 dB.\n\n"
+            "- Paste is blocked only when both source layer and source channel exactly match the destination. Copying L to R in the same layer is allowed.\n\n"
             "TARGET, RAW, AND AUTOEQ\n\n"
             "- Import Target and Import RAW use the same TXT, CSV, and WAV import engine. Each reference category supports up to six layers.\n"
             "- Target curves are dotted references. RAW measurements use thinner translucent lines. Neither category affects audio or the EQ Average.\n"
@@ -166,15 +415,16 @@ namespace
             "- Frequency, Gain, Q, enable, type, reset, copy, paste, inverted paste, and removal are available per active layer.\n\n"
             "GLOBAL CONTROLS\n\n"
             "- Dry/Wet blends latency-aligned dry audio with the correction and visually flattens audible EQ/Average curves toward 0%. RAW, Target, and Tracking references remain in their analysis frame.\n"
-            "- Crossfeed reduces hard headphone stereo separation.\n"
+            "- Crossfeed reduces hard headphone stereo separation. Advanced opens the algorithm selector: Natural uses geometry-based delay/head-shadow style crossfeed; BS2B/RME style uses a filtered crossfeed topology. Geometry presets adjust head dimensions, speaker angle, cutoff, and direct level.\n"
+            "- Balance is a final stereo trim. Negative values shift the corrected output left, positive values shift it right, and audible EQ/Average curves show the same L/R offset.\n"
             "- Gain is a bipolar final output trim and moves audible EQ/Average curves. It does not rewrite or reposition RAW, Target, or Tracking references.\n"
             "- Input Gain is applied before correction and before the Input meter.\n"
             "- Output Gain is applied after correction and Auto Gain, before the final Global Gain stage.\n"
             "- Auto Gain is an output trim for honest level-matched A/B monitoring. It does not change Input Gain, compress, reshape transients, or alter the FIR.\n"
             "- Match Output to Input follows the RMS difference between corrected and input audio. It may boost or cut, but every audio block constrains positive compensation to its current peak headroom so previously learned gain cannot clip OUT after a curve or layer change.\n"
-            "- Downward Match never boosts. It also remembers the greatest required peak reduction and only ratchets downward until Auto Gain is reset, disabled, or its mode changes.\n"
-            "- The meter shows IN, PRE, and OUT RMS/Peak. PRE is measured after correction and manual output stages but before Auto Gain, so correction-induced clipping remains visible even when the final output is attenuated safely.\n"
-            "- Reset Meters clears held meter and clip displays without changing the currently learned Auto Gain trim.\n"
+            "- Downward Match never boosts. It also remembers the greatest required peak reduction and only ratchets downward until Auto Gain is disabled, its mode changes, or the project state resets it.\n"
+            "- The meter shows live IN, PRE, and OUT RMS/Peak. PRE is measured after correction and manual output stages but before Auto Gain, so correction-induced clipping remains visible even when the final output is attenuated safely.\n"
+            "- Meter bars, top peak numbers, and lower IN/AUTO/OUT readouts are dynamic. They do not latch held clip states; red/orange status follows the current audio block and Auto Gain amount.\n"
             "- Limiter is optional and only reduces peaks that exceed 0 dBFS.\n"
             "- Bypass passes the input and flattens audible EQ/Average curves. RAW and Target remain visible, while Tracking returns to the stored RAW response.\n"
             "- The padlock protects project-changing controls after rendering. Visual visibility and active-layer selection remain available; unlock before further edits.\n"
@@ -191,13 +441,14 @@ namespace
             "- Phase Mode is locked to Minimum during preview. After render it unlocks: Minimum is causal with zero reported latency; Natural is mixed-phase with moderate latency and reduced pre-ringing; Linear is symmetric with full latency and flat phase.\n"
             "- Any edit marks the FIR outdated, returns to Minimum preview, and requires a new render.\n"
             "- FIR tap counts and latency scale from a 44.1 kHz reference so responses remain stable at 44.1, 48, 88.2, 96, 176.4, 192 kHz, and other rates.\n"
-            "- The top Export FIR button is enabled only for a current rendered FIR and writes a mono 32-bit WAV at the host sample rate.\n"
+            "- The top Export FIR button is enabled only for a current rendered FIR and writes a 32-bit WAV at the host sample rate. Linked channels export as mono; split channels export as a true stereo FIR.\n"
             "- Each Blend layer and Average can be exported independently as FIR WAV, frequency/dB TXT or CSV, GraphicEQ/APO text, Melda CSV, or APO parametric text. Parametric export approximates the complete displayed curve with a practical filter set.\n"
+            "- When a text format cannot contain independent channels in one file, FlexCurve writes separate _L and _R files.\n"
             "- GraphicEQ/APO exports preserve layer gain as Preamp. FlexCurve FIR WAV exports preserve it as metadata. Other curve formats bake the gain into their exported dB values, so it is never lost or duplicated.\n\n"
             "PRESETS\n\n"
             "- The Presets menu loads, saves, and deletes .flexcurvepreset files in %APPDATA%\\Mixomo\\FlexCurve\\UserPresets\\.\n"
             "- Compatible .calcurvepreset and XML state files can be loaded for migration from CalCurve.\n"
-            "- Presets embed every source curve plus names, colors, V/M/S, layer gains, normalization offsets, source smoothing, Blend, Graphic/Variable EQ, Parametric filters, active layer, Average state, Input/Output Gain, Auto Gain mode, FIR-export options, global controls, phase, and rendered state where available.\n"
+            "- Presets embed every source curve plus names, colors, V/M/S, complete L/R link/selection/edit state, layer gains, normalization offsets, source smoothing, Blend, Graphic/Variable EQ, Parametric filters, active layer, Average state, Input/Output Gain, Auto Gain mode, FIR-export options, global controls, phase, and rendered state where available.\n"
             "- Embedded curves keep presets usable if original imported files move or disappear.\n\n"
             "CREDITS\n\n"
             "Development: Ezequiel Casas (Mixomo)\nhttps://github.com/Mixomo\n\n"
@@ -269,9 +520,11 @@ int FlexCurveGraph::getLegendRowCount() const
         if (layer.visible && processor.isLayerTypeVisible (layer.type))
         {
             ++count;
+            if (! layer.channelsLinked) ++count;
             if (layer.type == FlexCurveLayerType::target) ++targetCount;
             if (layer.type == FlexCurveLayerType::raw) ++rawCount;
-            if (layer.type == FlexCurveLayerType::eq && layer.autoEqRawLayerId > 0) ++count;
+            if (layer.type == FlexCurveLayerType::eq && layer.autoEqRawLayerId > 0)
+                count += layer.channelsLinked ? 1 : 2;
         }
     if (targetCount >= 2) ++count;
     if (rawCount >= 2) ++count;
@@ -282,9 +535,6 @@ juce::Rectangle<float> FlexCurveGraph::getPlotBounds() const
 {
     auto graph = getLocalBounds().toFloat().reduced (16.0f, 12.0f);
     graph.removeFromBottom (26.0f);
-    const auto rows = getLegendRowCount();
-    if (rows > 0)
-        graph.removeFromTop (static_cast<float> (rows * 22 + 4));
     return graph;
 }
 
@@ -611,23 +861,46 @@ void FlexCurveGraph::paint (juce::Graphics& g)
             continue;
         if (! layer.visible || ! processor.isLayerTypeVisible (layer.type))
             continue;
-        const auto curve = layer.type == FlexCurveLayerType::eq
-            ? graphDisplayAudioCurveFor (processor, processor.getLayerCurve (layer.id))
-            : processor.getLayerCurveForDisplay (layer.id);
-        if (curve.empty())
-            continue;
         const auto alpha = layer.type == FlexCurveLayerType::raw ? 0.46f : 1.0f;
-        g.setColour ((layer.muted ? layer.colour.darker (0.55f) : layer.colour).withAlpha (alpha));
-        drawLayerPath (layer, curve, 1.55f);
+        auto drawChannel = [&] (FlexChannelSelection channel, juce::Colour colour)
+        {
+            const auto curve = layer.type == FlexCurveLayerType::eq
+                ? graphDisplayAudioCurveFor (processor, processor.getLayerCurve (layer.id, channel), channel)
+                : processor.getLayerCurveForDisplay (layer.id, channel);
+            if (! curve.empty())
+            {
+                g.setColour ((layer.muted ? colour.darker (0.55f) : colour).withAlpha (alpha));
+                drawLayerPath (layer, curve, 1.55f);
+            }
+        };
+        drawChannel (FlexChannelSelection::left,
+                     layer.channelsLinked ? layer.colour : layer.colour.darker (0.32f));
+        if (! layer.channelsLinked)
+            drawChannel (FlexChannelSelection::right, layer.colour.brighter (0.30f));
     }
 
     if (processor.isAverageVisible())
     {
-        const auto average = graphDisplayAudioCurveFor (processor, processor.getAverageCurve());
-        if (! average.empty())
+        const auto averageLeft = graphDisplayAudioCurveFor (
+            processor, processor.getAverageCurve (FlexChannelSelection::left),
+            FlexChannelSelection::left);
+        const auto globalBalanceVisible = std::abs (
+            processor.parameters.getRawParameterValue ("globalbalance")->load()) > 0.001f;
+        if (! averageLeft.empty())
         {
-            g.setColour (juce::Colours::white);
-            g.strokePath (buildPath (average, graph, minDb, maxDb), juce::PathStrokeType (2.0f));
+            g.setColour ((processor.averageChannelsDiffer() || globalBalanceVisible)
+                             ? juce::Colours::white.darker (0.28f) : juce::Colours::white);
+            g.strokePath (buildPath (averageLeft, graph, minDb, maxDb),
+                          juce::PathStrokeType (2.0f));
+            if (processor.averageChannelsDiffer() || globalBalanceVisible)
+            {
+                const auto averageRight = graphDisplayAudioCurveFor (
+                    processor, processor.getAverageCurve (FlexChannelSelection::right),
+                    FlexChannelSelection::right);
+                g.setColour (juce::Colours::white.brighter (0.12f));
+                g.strokePath (buildPath (averageRight, graph, minDb, maxDb),
+                              juce::PathStrokeType (2.0f));
+            }
         }
     }
 
@@ -643,18 +916,38 @@ void FlexCurveGraph::paint (juce::Graphics& g)
     });
     if (visibleTargets >= 2)
     {
-        const auto average = processor.getAverageCurveForTypeForDisplay (FlexCurveLayerType::target);
+        const auto average = processor.getAverageCurveForTypeForDisplay (
+            FlexCurveLayerType::target, FlexChannelSelection::left);
+        const auto averageRight = processor.getAverageCurveForTypeForDisplay (
+            FlexCurveLayerType::target, FlexChannelSelection::right);
         juce::Path dashed;
         const float pattern[] { 7.0f, 4.0f };
         juce::PathStrokeType (1.8f).createDashedStroke (dashed, buildPath (average, graph, minDb, maxDb), pattern, 2);
         g.setColour (juce::Colours::white.withAlpha (0.72f));
         g.fillPath (dashed);
+        if (curvesDiffer (average, averageRight))
+        {
+            juce::Path rightDashed;
+            juce::PathStrokeType (1.8f).createDashedStroke (
+                rightDashed, buildPath (averageRight, graph, minDb, maxDb), pattern, 2);
+            g.setColour (juce::Colours::white.withAlpha (0.42f));
+            g.fillPath (rightDashed);
+        }
     }
     if (visibleRaws >= 2)
     {
-        const auto average = processor.getAverageCurveForTypeForDisplay (FlexCurveLayerType::raw);
+        const auto average = processor.getAverageCurveForTypeForDisplay (
+            FlexCurveLayerType::raw, FlexChannelSelection::left);
+        const auto averageRight = processor.getAverageCurveForTypeForDisplay (
+            FlexCurveLayerType::raw, FlexChannelSelection::right);
         g.setColour (juce::Colours::lightgrey.withAlpha (0.56f));
         g.strokePath (buildPath (average, graph, minDb, maxDb), juce::PathStrokeType (1.15f));
+        if (curvesDiffer (average, averageRight))
+        {
+            g.setColour (juce::Colours::lightgrey.withAlpha (0.32f));
+            g.strokePath (buildPath (averageRight, graph, minDb, maxDb),
+                          juce::PathStrokeType (1.15f));
+        }
     }
 
     for (const auto& layer : layers)
@@ -662,15 +955,21 @@ void FlexCurveGraph::paint (juce::Graphics& g)
         if (! processor.areCorrectedMeasurementsVisible()
             || layer.type != FlexCurveLayerType::eq || layer.autoEqRawLayerId <= 0 || ! layer.visible)
             continue;
-        const auto corrected = processor.getCorrectedMeasurementCurve (layer.id);
-        if (corrected.empty())
-            continue;
-        const auto path = buildPath (corrected, graph, minDb, maxDb);
-        juce::Path dashed;
-        const float pattern[] { 3.0f, 3.0f };
-        juce::PathStrokeType (1.7f).createDashedStroke (dashed, path, pattern, 2);
-        g.setColour (layer.colour.darker (0.55f));
-        g.fillPath (dashed);
+        auto drawTracking = [&] (FlexChannelSelection channel, juce::Colour colour)
+        {
+            const auto corrected = processor.getCorrectedMeasurementCurve (layer.id, channel);
+            if (corrected.empty())
+                return;
+            const auto path = buildPath (corrected, graph, minDb, maxDb);
+            juce::Path dashed;
+            const float pattern[] { 3.0f, 3.0f };
+            juce::PathStrokeType (1.7f).createDashedStroke (dashed, path, pattern, 2);
+            g.setColour (colour);
+            g.fillPath (dashed);
+        };
+        drawTracking (FlexChannelSelection::left, layer.colour.darker (0.62f));
+        if (! layer.channelsLinked)
+            drawTracking (FlexChannelSelection::right, layer.colour.darker (0.38f));
     }
 
     if (activeLayerId > 0)
@@ -686,20 +985,31 @@ void FlexCurveGraph::paint (juce::Graphics& g)
             {
                 return layer.id == activeLayerId;
             });
-            const auto activeCurve = activeIt != layers.end() && activeIt->type == FlexCurveLayerType::eq
-                ? graphDisplayAudioCurveFor (processor, processor.getLayerCurve (activeLayerId))
-                : processor.getLayerCurveForDisplay (activeLayerId);
-            if (! activeCurve.empty())
+            if (activeIt != layers.end())
             {
-                auto activeColour = juce::Colours::white;
-                for (const auto& layer : layers)
-                    if (layer.id == activeLayerId)
-                        activeColour = layer.colour;
-                if (activeIt != layers.end())
+                auto drawActiveChannel = [&] (FlexChannelSelection channel, juce::Colour colour,
+                                               float width)
                 {
-                    g.setColour (activeColour.withAlpha (activeIt->type == FlexCurveLayerType::raw ? 0.78f : 1.0f));
-                    drawLayerPath (*activeIt, activeCurve, 2.8f);
-                }
+                    const auto curve = activeIt->type == FlexCurveLayerType::eq
+                        ? graphDisplayAudioCurveFor (
+                            processor, processor.getLayerCurve (activeLayerId, channel), channel)
+                        : processor.getLayerCurveForDisplay (activeLayerId, channel);
+                    if (! curve.empty())
+                    {
+                        g.setColour (colour.withAlpha (
+                            activeIt->type == FlexCurveLayerType::raw ? 0.78f : 1.0f));
+                        drawLayerPath (*activeIt, curve, width);
+                    }
+                };
+                const auto selected = activeIt->selectedChannel;
+                drawActiveChannel (FlexChannelSelection::left,
+                                   activeIt->channelsLinked ? activeIt->colour
+                                                            : activeIt->colour.darker (0.32f),
+                                   selected == FlexChannelSelection::right ? 2.0f : 2.8f);
+                if (! activeIt->channelsLinked)
+                    drawActiveChannel (FlexChannelSelection::right,
+                                       activeIt->colour.brighter (0.30f),
+                                       selected == FlexChannelSelection::left ? 2.0f : 2.8f);
             }
         }
     }
@@ -746,16 +1056,29 @@ void FlexCurveGraph::paint (juce::Graphics& g)
     }
 
     const auto showAverageLegend = processor.isAverageVisible() && ! processor.getAverageCurve().empty();
-    const auto legendCount = static_cast<int> (legendLayers.size()) + (showAverageLegend ? 1 : 0)
+    const auto channelLegendCount = std::accumulate (
+        legendLayers.begin(), legendLayers.end(), 0,
+        [] (int total, const auto* layer) { return total + (layer->channelsLinked ? 1 : 2); });
+    const auto trackingChannelLegendCount = std::accumulate (
+        trackingLegendLayers.begin(), trackingLegendLayers.end(), 0,
+        [] (int total, const auto* layer) { return total + (layer->channelsLinked ? 1 : 2); });
+    const auto legendCount = channelLegendCount
+                           + (showAverageLegend ? (processor.averageChannelsDiffer() ? 2 : 1) : 0)
                            + (visibleTargets >= 2 ? 1 : 0) + (visibleRaws >= 2 ? 1 : 0)
-                           + static_cast<int> (trackingLegendLayers.size());
+                           + trackingChannelLegendCount;
     auto legendArea = bounds.reduced (80.0f, 12.0f);
     legendArea = legendArea.removeFromTop (static_cast<float> (getLegendRowCount() * 22));
     g.setFont (juce::FontOptions (10.5f));
     const auto columns = juce::jmin (6, juce::jmax (1, legendCount));
     const auto itemWidth = legendArea.getWidth() / static_cast<float> (columns);
+    if (legendCount > 0)
+    {
+        g.setColour (juce::Colour (0xff0c0f13).withAlpha (0.72f));
+        g.fillRoundedRectangle (legendArea.expanded (6.0f, 3.0f), 5.0f);
+    }
     int legendIndex = 0;
-    auto drawLegendItem = [&] (juce::String text, juce::Colour colour, int id, bool active, bool muted)
+    auto drawLegendItem = [&] (juce::String text, juce::Colour colour, int id,
+                               FlexChannelSelection channel, bool active, bool muted)
     {
         const auto row = legendIndex / 6;
         const auto column = legendIndex % 6;
@@ -763,7 +1086,7 @@ void FlexCurveGraph::paint (juce::Graphics& g)
                                             legendArea.getY() + row * 22.0f,
                                             itemWidth,
                                             20.0f);
-        legendHitBoxes.push_back ({ item, id });
+        legendHitBoxes.push_back ({ item, id, channel });
         g.setColour (colour);
         auto swatch = item.removeFromLeft (10.0f).withSizeKeepingCentre (8.0f, 8.0f);
         g.fillRoundedRectangle (swatch, 2.0f);
@@ -780,22 +1103,57 @@ void FlexCurveGraph::paint (juce::Graphics& g)
     {
         const auto prefix = layer->type == FlexCurveLayerType::target ? "Target: "
                           : layer->type == FlexCurveLayerType::raw ? "RAW: " : "";
-        drawLegendItem (prefix + layer->name, layer->colour, layer->id,
-                        layer->id == activeLayerId, layer->muted);
+        if (layer->channelsLinked)
+            drawLegendItem (prefix + layer->name + " [L+R]", layer->colour, layer->id,
+                            FlexChannelSelection::stereo, layer->id == activeLayerId, layer->muted);
+        else
+        {
+            drawLegendItem (prefix + layer->name + " [L]", layer->colour.darker (0.32f),
+                            layer->id, FlexChannelSelection::left, layer->id == activeLayerId
+                                && layer->selectedChannel != FlexChannelSelection::right,
+                            layer->muted);
+            drawLegendItem (prefix + layer->name + " [R]", layer->colour.brighter (0.30f),
+                            layer->id, FlexChannelSelection::right, layer->id == activeLayerId
+                                && layer->selectedChannel == FlexChannelSelection::right,
+                            layer->muted);
+        }
     }
     for (const auto* layer : trackingLegendLayers)
-        drawLegendItem ("Corrected: " + layer->name
-                            + (layer->autoEqSourcesOutdated ? " (source changed)" : ""),
-                        layer->colour.darker (0.55f),
-                        0, false, layer->muted);
+    {
+        const auto suffix = layer->autoEqSourcesOutdated ? " (source changed)" : "";
+        if (layer->channelsLinked)
+            drawLegendItem ("Corrected: " + layer->name + " [L+R]" + suffix,
+                            layer->colour.darker (0.55f), 0, FlexChannelSelection::stereo,
+                            false, layer->muted);
+        else
+        {
+            drawLegendItem ("Corrected: " + layer->name + " [L]" + suffix,
+                            layer->colour.darker (0.68f), 0, FlexChannelSelection::left,
+                            false, layer->muted);
+            drawLegendItem ("Corrected: " + layer->name + " [R]" + suffix,
+                            layer->colour.darker (0.38f), 0, FlexChannelSelection::right,
+                            false, layer->muted);
+        }
+    }
     if (showAverageLegend)
     {
-        drawLegendItem ("Average", juce::Colours::white, -1, activeLayerId == -1, false);
+        if (processor.averageChannelsDiffer())
+        {
+            drawLegendItem ("Average [L]", juce::Colours::white.darker (0.28f),
+                            -1, FlexChannelSelection::left, activeLayerId == -1, false);
+            drawLegendItem ("Average [R]", juce::Colours::white.brighter (0.12f),
+                            -1, FlexChannelSelection::right, activeLayerId == -1, false);
+        }
+        else
+            drawLegendItem ("Average [L+R]", juce::Colours::white,
+                            -1, FlexChannelSelection::stereo, activeLayerId == -1, false);
     }
     if (visibleTargets >= 2)
-        drawLegendItem ("Average Target", juce::Colours::white.withAlpha (0.72f), 0, false, false);
+        drawLegendItem ("Average Target", juce::Colours::white.withAlpha (0.72f), 0,
+                        FlexChannelSelection::stereo, false, false);
     if (visibleRaws >= 2)
-        drawLegendItem ("Average RAW", juce::Colours::lightgrey.withAlpha (0.70f), 0, false, false);
+        drawLegendItem ("Average RAW", juce::Colours::lightgrey.withAlpha (0.70f), 0,
+                        FlexChannelSelection::stereo, false, false);
 
     if (marqueeSelecting)
     {
@@ -826,9 +1184,11 @@ void FlexCurveGraph::mouseDoubleClick (const juce::MouseEvent& e)
 void FlexCurveGraph::mouseDown (const juce::MouseEvent& e)
 {
     for (const auto& hit : legendHitBoxes)
-        if (hit.first.contains (e.position))
+        if (hit.bounds.contains (e.position))
         {
-            processor.setActiveLayerId (hit.second);
+            processor.setActiveLayerId (hit.layerId);
+            if (hit.layerId > 0)
+                processor.setLayerChannelSelection (hit.layerId, hit.channel);
             repaint();
             return;
         }
@@ -1076,6 +1436,7 @@ public:
     {
         viewport.setViewedComponent (&rowsContent, false);
         viewport.setScrollBarsShown (true, false);
+        styleScrollBar (viewport.getVerticalScrollBar());
         addAndMakeVisible (viewport);
 
         layerVisibilityLabel.setText ("Layer Visibility:", juce::dontSendNotification);
@@ -1126,7 +1487,7 @@ public:
         };
         addAndMakeVisible (reset);
 
-        blendModeLabel.setText ("Blend Apply Mode:", juce::dontSendNotification);
+        blendModeLabel.setText ("|  Blend Apply Mode:", juce::dontSendNotification);
         blendModeLabel.setColour (juce::Label::textColourId, inkColour());
         blendModeLabel.setFont (juce::FontOptions (13.0f));
         addAndMakeVisible (blendModeLabel);
@@ -1305,13 +1666,15 @@ public:
     ~BlendTab() override
     {
         stopTimer();
+        exportChooser.reset();
+        importChooser.reset();
+        viewport.setViewedComponent (nullptr, false);
+        rowsContent.removeAllChildren();
     }
 
     void paint (juce::Graphics& g) override
     {
-        g.setColour (mutedColour());
-        if (processor.getLayers().empty())
-            g.drawText ("Import a curve or add a flat layer to start.", layerArea, juce::Justification::centred);
+        juce::ignoreUnused (g);
     }
 
     void resized() override
@@ -1324,29 +1687,25 @@ public:
         showRaw.setBounds (visibilityRow.removeFromLeft (72));
         showTracking.setBounds (visibilityRow.removeFromLeft (100));
         showAverage.setBounds (visibilityRow.removeFromLeft (96));
-
-        area.removeFromTop (4);
-        auto modeRow = area.removeFromTop (32);
-        blendModeLabel.setBounds (modeRow.removeFromLeft (126));
-        perLayer.setBounds (modeRow.removeFromLeft (100));
-        globalAverage.setBounds (modeRow.removeFromLeft (178));
-        reset.setBounds (modeRow.removeFromRight (90));
+        visibilityRow.removeFromLeft (26);
+        blendModeLabel.setBounds (visibilityRow.removeFromLeft (158));
+        perLayer.setBounds (visibilityRow.removeFromLeft (100));
+        globalAverage.setBounds (visibilityRow.removeFromLeft (178));
 
         area.removeFromTop (6);
         auto importRow = area.removeFromTop (34);
         importTarget.setBounds (importRow.removeFromLeft (150));
         importRow.removeFromLeft (10);
         importRaw.setBounds (importRow.removeFromLeft (150));
-
-        area.removeFromTop (6);
-        auto normalizeRow = area.removeFromTop (34);
-        normalizeReferences.setBounds (normalizeRow.removeFromLeft (218));
-        normalizeRow.removeFromLeft (6);
-        normalizeFrequency.setBounds (normalizeRow.removeFromLeft (72));
-        normalizeHzLabel.setBounds (normalizeRow.removeFromLeft (30));
-        normalizeReferencesHelp.setBounds (normalizeRow.removeFromLeft (34));
-        normalizeRow.removeFromLeft (12);
-        normalizeLayersToZero.setBounds (normalizeRow.removeFromLeft (210));
+        importRow.removeFromLeft (16);
+        normalizeReferences.setBounds (importRow.removeFromLeft (218));
+        importRow.removeFromLeft (6);
+        normalizeFrequency.setBounds (importRow.removeFromLeft (72));
+        normalizeHzLabel.setBounds (importRow.removeFromLeft (30));
+        normalizeReferencesHelp.setBounds (importRow.removeFromLeft (34));
+        importRow.removeFromLeft (12);
+        normalizeLayersToZero.setBounds (importRow.removeFromLeft (210));
+        reset.setBounds (importRow.removeFromRight (90));
 
         area.removeFromTop (6);
         auto selectorRow = area.removeFromTop (34);
@@ -1412,6 +1771,25 @@ private:
             addAndMakeVisible (mute);
             addAndMakeVisible (solo);
             addAndMakeVisible (visible);
+            channel.addItem ("L+R", 1);
+            channel.addItem ("L", 2);
+            channel.addItem ("R", 3);
+            styleCombo (channel);
+            channel.setTooltip ("Choose which channel this layer edits");
+            channel.onChange = [this]
+            {
+                if (! isAverage && channel.getSelectedId() > 0)
+                    processor.setLayerChannelSelection (
+                        layerId,
+                        static_cast<FlexChannelSelection> (channel.getSelectedId() - 1));
+            };
+            addAndMakeVisible (channel);
+            linkChannels.setButtonText ("Link");
+            styleButton (linkChannels);
+            linkChannels.setTooltip (
+                "Link L/R explicitly. R is copied to L when R is selected; otherwise L is copied to R.");
+            linkChannels.onClick = [this] { processor.linkLayerChannels (layerId); };
+            addAndMakeVisible (linkChannels);
             gain.setSliderStyle (juce::Slider::LinearHorizontal);
             gain.setTextBoxStyle (juce::Slider::TextBoxRight, false, 74, 22);
             const auto range = static_cast<double> (processor.getGlobalDbRange());
@@ -1421,6 +1799,15 @@ private:
             gain.setColour (juce::Slider::trackColourId, juce::Colour (0xff33404c));
             addAndMakeVisible (gain);
             installSliderReset (gain, 0.0);
+            balance.setSliderStyle (juce::Slider::LinearHorizontal);
+            balance.setTextBoxStyle (juce::Slider::TextBoxRight, false, 72, 22);
+            balance.setRange (-100.0, 100.0, 1.0);
+            balance.setTextValueSuffix ("");
+            balance.setColour (juce::Slider::thumbColourId, inkColour());
+            balance.setColour (juce::Slider::trackColourId, juce::Colour (0xff33404c));
+            balance.setTooltip ("Layer balance trim: -100 L, 0 center, +100 R");
+            addAndMakeVisible (balance);
+            installSliderReset (balance, 0.0);
             remove.setButtonText ("x");
             styleButton (remove);
             addAndMakeVisible (remove);
@@ -1470,6 +1857,14 @@ private:
                 {
                     processor.setActiveLayerId (layerId);
                     processor.setLayerGain (layerId, static_cast<float> (gain.getValue()));
+                }
+            };
+            balance.onValueChange = [this]
+            {
+                if (! isAverage)
+                {
+                    processor.setActiveLayerId (layerId);
+                    processor.setLayerBalance (layerId, panPercentToBalanceDb (static_cast<float> (balance.getValue())));
                 }
             };
             remove.onClick = [this]
@@ -1526,6 +1921,8 @@ private:
                     name.setText ("Average", false);
                 name.setReadOnly (true);
                 gain.setEnabled (false);
+                balance.setEnabled (false);
+                balance.setVisible (false);
                 reset.setEnabled (false);
                 reset.setVisible (false);
                 invert.setVisible (false);
@@ -1537,6 +1934,8 @@ private:
                 exportCurve.setEnabled (true);
                 clone.setVisible (false);
                 smooth.setVisible (false);
+                channel.setVisible (false);
+                linkChannels.setVisible (false);
                 return;
             }
 
@@ -1552,17 +1951,31 @@ private:
             mute.setToggleState (it->muted, juce::dontSendNotification);
             solo.setToggleState (it->solo, juce::dontSendNotification);
             visible.setToggleState (it->visible, juce::dontSendNotification);
-            smooth.setToggleState (it->smoothSourceCurve, juce::dontSendNotification);
+            smooth.setToggleState (
+                it->selectedChannel == FlexChannelSelection::right && ! it->channelsLinked
+                    ? it->right.smoothSourceCurve : it->smoothSourceCurve,
+                juce::dontSendNotification);
+            channel.setVisible (true);
+            channel.setSelectedId (static_cast<int> (it->selectedChannel) + 1,
+                                   juce::dontSendNotification);
+            linkChannels.setVisible (true);
+            linkChannels.setButtonText (it->channelsLinked ? "Linked" : "Link");
             if (! gain.isMouseButtonDown())
             {
                 const auto range = processor.getGlobalDbRange();
                 gain.setRange (-range, range, 0.1);
-                gain.setValue (it->gainDb, juce::dontSendNotification);
+                const auto channelGain = it->selectedChannel == FlexChannelSelection::right
+                                      && ! it->channelsLinked
+                    ? it->right.gainDb : it->gainDb;
+                gain.setValue (channelGain, juce::dontSendNotification);
             }
+            if (! balance.isMouseButtonDown())
+                balance.setValue (balanceDbToPanPercent (it->balanceDb), juce::dontSendNotification);
             const auto isEq = layerType == FlexCurveLayerType::eq;
             mute.setVisible (isEq);
             solo.setVisible (isEq);
             gain.setVisible (true);
+            balance.setVisible (isEq);
             invert.setVisible (isEq);
             reset.setVisible (true);
             invert.setToggleState (it->inverted, juce::dontSendNotification);
@@ -1574,6 +1987,7 @@ private:
             mute.setEnabled (editable && isEq);
             solo.setEnabled (editable && isEq);
             gain.setEnabled (editable);
+            balance.setEnabled (editable && isEq);
             reset.setEnabled (editable);
             invert.setEnabled (editable && isEq);
             remove.setEnabled (editable);
@@ -1581,6 +1995,8 @@ private:
             clone.setEnabled (editable && processor.canAddLayerType (layerType));
             smooth.setVisible (true);
             smooth.setEnabled (editable);
+            channel.setEnabled (true);
+            linkChannels.setEnabled (editable && ! it->channelsLinked);
             visible.setEnabled (true);
             exportCurve.setEnabled (true);
         }
@@ -1611,28 +2027,52 @@ private:
         {
             auto area = getLocalBounds().reduced (6, 4);
             area.removeFromLeft (18);
-            visible.setBounds (area.removeFromLeft (34));
             const auto isEq = ! isAverage && layerType == FlexCurveLayerType::eq;
+
+            const auto actionWidth = (isEq ? 62 : 0)
+                                   + (! isAverage ? 62 : 0)
+                                   + 70
+                                   + (! isAverage ? 62 : 0)
+                                   + (! isAverage ? 82 : 0)
+                                   + (! isAverage ? 36 : 0);
+            auto actions = area.removeFromRight (juce::jmin (actionWidth, area.getWidth() / 2));
+
+            visible.setBounds (area.removeFromLeft (34));
             if (isEq)
             {
                 mute.setBounds (area.removeFromLeft (38));
                 solo.setBounds (area.removeFromLeft (38));
             }
-            name.setBounds (area.removeFromLeft (200));
+            if (! isAverage)
+            {
+                channel.setBounds (area.removeFromRight (118).reduced (2, 0));
+                area.removeFromRight (4);
+                linkChannels.setBounds (area.removeFromRight (82).reduced (2, 0));
+                area.removeFromRight (6);
+            }
+
+            const auto nameWidth = isAverage ? 190 : juce::jlimit (180, 260, area.getWidth() / 3);
+            name.setBounds (area.removeFromLeft (nameWidth));
+            area.removeFromLeft (8);
             if (isAverage || ! isEq)
-                gain.setBounds (area.removeFromLeft (220));
+                gain.setBounds (area);
             else
-                gain.setBounds (area.removeFromLeft (210));
+            {
+                auto gainArea = area.removeFromLeft (juce::jmax (230, area.getWidth() / 2));
+                gain.setBounds (gainArea.reduced (2, 0));
+                balance.setBounds (area.reduced (8, 0));
+            }
             if (isEq)
-                invert.setBounds (area.removeFromLeft (58).reduced (2, 0));
+                invert.setBounds (actions.removeFromLeft (62).reduced (2, 0));
             if (! isAverage)
-                clone.setBounds (area.removeFromLeft (58).reduced (2, 0));
+                clone.setBounds (actions.removeFromLeft (62).reduced (2, 0));
+            exportCurve.setBounds (actions.removeFromLeft (70).reduced (2, 0));
             if (! isAverage)
-                smooth.setBounds (area.removeFromLeft (70).reduced (2, 0));
-            exportCurve.setBounds (area.removeFromLeft (66).reduced (2, 0));
+                reset.setBounds (actions.removeFromLeft (62).reduced (2, 0));
             if (! isAverage)
-                reset.setBounds (area.removeFromLeft (58).reduced (2, 0));
-            remove.setBounds (area.removeFromRight (32));
+                smooth.setBounds (actions.removeFromLeft (82).reduced (2, 0));
+            if (! isAverage)
+                remove.setBounds (actions.removeFromRight (32));
         }
 
         FlexCurveAudioProcessor& processor;
@@ -1642,8 +2082,9 @@ private:
         juce::Colour colour;
         juce::TextEditor name;
         juce::ToggleButton visible, mute, solo;
-        FlexCurveResettableSlider gain;
-        juce::TextButton reset, invert, clone, exportCurve, remove;
+        juce::ComboBox channel;
+        FlexCurveResettableSlider gain, balance;
+        juce::TextButton reset, invert, clone, exportCurve, remove, linkChannels;
         juce::ToggleButton smooth;
         std::function<void()> onChanged;
         std::function<void(int, bool, juce::String)> onExport;
@@ -1970,13 +2411,13 @@ public:
 
         pointViewport.setViewedComponent (&pointRowsContent, false);
         pointViewport.setScrollBarsShown (true, false);
+        styleScrollBar (pointViewport.getVerticalScrollBar());
         addAndMakeVisible (pointViewport);
 
         hint.setColour (juce::Label::textColourId, mutedColour());
         hint.setFont (juce::FontOptions (15.0f));
         hint.setJustificationType (juce::Justification::centred);
-        hint.setText ("Choose an active layer or add a new layer to edit Graphic EQ.", juce::dontSendNotification);
-        addAndMakeVisible (hint);
+        hint.setText ({}, juce::dontSendNotification);
 
         rebuildControls();
         startTimerHz (10);
@@ -1985,6 +2426,8 @@ public:
     ~GraphicTab() override
     {
         stopTimer();
+        pointViewport.setViewedComponent (nullptr, false);
+        pointRowsContent.removeAllChildren();
     }
 
     void resized() override
@@ -2356,7 +2799,7 @@ private:
         copyEq.setEnabled (editable);
         pasteEq.setEnabled (editable && processor.canPasteCurrentGraphicEq());
         pasteInvertedEq.setEnabled (editable && processor.canPasteCurrentGraphicEq());
-        hint.setVisible (! hasLayer);
+        hint.setVisible (false);
         for (auto& slider : sliders)
             slider->setEnabled (editable);
         for (auto& row : pointRows)
@@ -2417,6 +2860,7 @@ public:
     {
         viewport.setViewedComponent (&rowsContent, false);
         viewport.setScrollBarsShown (true, false);
+        styleScrollBar (viewport.getVerticalScrollBar());
         addAndMakeVisible (viewport);
         addBand.setButtonText ("+ Filter");
         styleButton (addBand);
@@ -2449,8 +2893,7 @@ public:
         hint.setColour (juce::Label::textColourId, mutedColour());
         hint.setFont (juce::FontOptions (15.0f));
         hint.setJustificationType (juce::Justification::centred);
-        hint.setText ("Choose an active layer or add a new layer to edit Parametric EQ.", juce::dontSendNotification);
-        addAndMakeVisible (hint);
+        hint.setText ({}, juce::dontSendNotification);
         rebuild();
         startTimerHz (10);
     }
@@ -2458,6 +2901,8 @@ public:
     ~ParametricTab() override
     {
         stopTimer();
+        viewport.setViewedComponent (nullptr, false);
+        rowsContent.removeAllChildren();
     }
 
     void resized() override
@@ -2628,7 +3073,7 @@ private:
         copyEq.setEnabled (editable);
         pasteEq.setEnabled (editable && processor.canPasteCurrentParametricEq());
         pasteInvertedEq.setEnabled (editable && processor.canPasteCurrentParametricEq());
-        hint.setVisible (! hasLayer);
+        hint.setVisible (false);
         for (auto& row : rows)
         {
             row->setEnabled (editable);
@@ -2657,11 +3102,22 @@ private:
     std::vector<int> selectedBands;
 };
 
-class FlexCurveAudioProcessorEditor::GlobalLayerRack final : public juce::Component
+class FlexCurveAudioProcessorEditor::GlobalLayerRack final : public juce::Component,
+                                                             private juce::ScrollBar::Listener
 {
 public:
-    explicit GlobalLayerRack (FlexCurveAudioProcessor& p) : processor (p)
-    {}
+    explicit GlobalLayerRack (FlexCurveAudioProcessor& p) : processor (p), horizontalScroll (false)
+    {
+        horizontalScroll.addListener (this);
+        horizontalScroll.setAutoHide (false);
+        styleScrollBar (horizontalScroll);
+        addAndMakeVisible (horizontalScroll);
+    }
+
+    ~GlobalLayerRack() override
+    {
+        horizontalScroll.removeListener (this);
+    }
 
     bool sync()
     {
@@ -2695,12 +3151,44 @@ public:
     void resized() override
     {
         auto area = getLocalBounds();
+        const auto scrollHeight = 8;
+        auto scrollArea = area.removeFromBottom (scrollHeight);
         if (rows.empty())
+        {
+            horizontalScroll.setVisible (false);
             return;
+        }
 
-        const auto width = juce::jmin (118, area.getWidth() / static_cast<int> (rows.size()));
+        constexpr int rowWidth = 286;
+        constexpr int rowHeight = 30;
+        constexpr int gap = 5;
+        const auto totalWidth = static_cast<int> (rows.size()) * rowWidth
+                              + juce::jmax (0, static_cast<int> (rows.size()) - 1) * gap;
+        const auto visibleWidth = area.getWidth();
+        const auto canScroll = totalWidth > visibleWidth;
+        horizontalScroll.setVisible (canScroll);
+        horizontalScroll.setBounds (scrollArea.reduced (0, 1));
+        horizontalScroll.setRangeLimits (0.0, static_cast<double> (juce::jmax (totalWidth, visibleWidth)));
+        horizontalScroll.setCurrentRange (juce::jlimit (0.0, static_cast<double> (juce::jmax (0, totalWidth - visibleWidth)),
+                                                       horizontalScroll.getCurrentRangeStart()),
+                                          static_cast<double> (visibleWidth),
+                                          juce::dontSendNotification);
+
+        auto x = area.getX() - static_cast<int> (std::round (horizontalScroll.getCurrentRangeStart()));
+        auto y = area.getY();
         for (auto& row : rows)
-            row->setBounds (area.removeFromLeft (juce::jmin (width, area.getWidth())).reduced (2, 1));
+        {
+            row->setBounds (x, y, rowWidth, rowHeight);
+            x += rowWidth + gap;
+        }
+    }
+
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& wheel) override
+    {
+        if (! horizontalScroll.isVisible())
+            return;
+        const auto delta = (std::abs (wheel.deltaX) > std::abs (wheel.deltaY) ? wheel.deltaX : wheel.deltaY) * -120.0;
+        horizontalScroll.setCurrentRangeStart (horizontalScroll.getCurrentRangeStart() + delta);
     }
 
 private:
@@ -2768,6 +3256,12 @@ private:
             {
                 addAndMakeVisible (*button);
             }
+            channel.addItem ("L+R", 1);
+            channel.addItem ("L", 2);
+            channel.addItem ("R", 3);
+            styleCombo (channel);
+            channel.setTooltip ("Editing channel for this layer");
+            addAndMakeVisible (channel);
 
             colourButton.onClick = [this] { processor.setActiveLayerId (layerId); };
 
@@ -2786,6 +3280,16 @@ private:
                 processor.setActiveLayerId (layerId);
                 processor.setLayerSolo (layerId, solo.getToggleState());
             };
+            channel.onChange = [this]
+            {
+                if (channel.getSelectedId() > 0)
+                {
+                    processor.setActiveLayerId (layerId);
+                    processor.setLayerChannelSelection (
+                        layerId,
+                        static_cast<FlexChannelSelection> (channel.getSelectedId() - 1));
+                }
+            };
         }
 
         void sync()
@@ -2803,6 +3307,8 @@ private:
             visible.setToggleState (it->visible, juce::dontSendNotification);
             mute.setToggleState (it->muted, juce::dontSendNotification);
             solo.setToggleState (it->solo, juce::dontSendNotification);
+            channel.setSelectedId (static_cast<int> (it->selectedChannel) + 1,
+                                   juce::dontSendNotification);
             visible.activeColour = colour.darker (0.35f);
             mute.activeColour = juce::Colour (0xffa33a45);
             solo.activeColour = juce::Colour (0xff387f68);
@@ -2818,6 +3324,7 @@ private:
             solo.setVisible (isEq);
             mute.setEnabled (isEq && ! processor.isEditLocked());
             solo.setEnabled (isEq && ! processor.isEditLocked());
+            channel.setEnabled (true);
             repaint();
         }
 
@@ -2829,10 +3336,11 @@ private:
         void resized() override
         {
             auto area = getLocalBounds();
-            colourButton.setBounds (area.removeFromLeft (30));
-            visible.setBounds (area.removeFromLeft (28));
-            mute.setBounds (area.removeFromLeft (28));
-            solo.setBounds (area.removeFromLeft (28));
+            colourButton.setBounds (area.removeFromLeft (34));
+            visible.setBounds (area.removeFromLeft (34).reduced (1, 0));
+            mute.setBounds (area.removeFromLeft (34).reduced (1, 0));
+            solo.setBounds (area.removeFromLeft (34).reduced (1, 0));
+            channel.setBounds (area.removeFromLeft (122).reduced (4, 2));
         }
 
         FlexCurveAudioProcessor& processor;
@@ -2844,16 +3352,25 @@ private:
         RackToggleButton visible { "V" };
         RackToggleButton mute { "M" };
         RackToggleButton solo { "S" };
+        juce::ComboBox channel;
     };
 
     FlexCurveAudioProcessor& processor;
     juce::String signature;
     std::vector<std::unique_ptr<Row>> rows;
+    juce::ScrollBar horizontalScroll;
+
+    void scrollBarMoved (juce::ScrollBar*, double) override
+    {
+        resized();
+    }
 };
 
 class FlexCurveAudioProcessorEditor::MeterPanel final : public juce::Component
 {
 public:
+    MeterPanel() = default;
+
     void setSnapshot (FlexCurveAudioProcessor::MeterSnapshot next)
     {
         snapshot = next;
@@ -2873,79 +3390,136 @@ public:
         g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
         g.drawText ("LEVELS", content.removeFromTop (18.0f), juce::Justification::centredLeft);
 
-        auto footer = content.removeFromBottom (42.0f);
-        auto scale = content.removeFromLeft (28.0f);
-        auto bars = content.reduced (4.0f, 2.0f);
-        const auto gap = 6.0f;
-        const auto barWidth = juce::jmax (7.0f, (bars.getWidth() - gap * 5.0f) / 6.0f);
-        const std::array<float, 6> values {
-            snapshot.inputRmsDb, snapshot.inputPeakDb,
-            snapshot.preAutoRmsDb, snapshot.preAutoPeakDb,
-            snapshot.outputRmsDb, snapshot.outputPeakDb
+        content.removeFromTop (3.0f);
+        auto meters = content.removeFromTop (juce::jmax (260.0f, content.getHeight() - 52.0f));
+        auto bars = meters.withTrimmedLeft (30.0f).withTrimmedRight (4.0f).withTrimmedTop (10.0f).withTrimmedBottom (42.0f);
+        const auto groupGap = 9.0f;
+        const auto innerGap = 3.0f;
+        const auto barWidth = juce::jmax (10.0f, (bars.getWidth() - groupGap * 2.0f - innerGap * 3.0f) / 6.0f);
+        const std::array<std::array<FlexCurveAudioProcessor::MeterSnapshot::Channel, 3>, 3> stages {
+            snapshot.inputChannels, snapshot.preAutoChannels, snapshot.outputChannels
         };
-        const std::array<juce::String, 6> labels { "R", "P", "R", "P", "R", "P" };
+        const std::array<juce::String, 3> stageLabels { "IN", "PRE", "OUT" };
 
-        g.setFont (juce::FontOptions (9.5f));
+        g.setFont (juce::FontOptions (8.5f));
         for (const auto db : { 0.0f, -12.0f, -24.0f, -36.0f, -48.0f, -60.0f })
         {
             const auto y = juce::jmap (db, -60.0f, 0.0f, bars.getBottom(), bars.getY());
             g.setColour (juce::Colour (0xff2a333d));
             g.drawHorizontalLine (static_cast<int> (std::round (y)), bars.getX(), bars.getRight());
             g.setColour (mutedColour());
-            g.drawText (juce::String (static_cast<int> (db)), static_cast<int> (scale.getX()), static_cast<int> (y - 7.0f),
-                        static_cast<int> (scale.getWidth() - 3.0f), 14, juce::Justification::centredRight);
+            g.drawText (juce::String (static_cast<int> (db)), static_cast<int> (meters.getX()), static_cast<int> (y - 6.0f),
+                        23, 12, juce::Justification::centredRight);
         }
 
-        for (size_t i = 0; i < values.size(); ++i)
+        const auto fmtDb = [] (float value, const juce::String& suffix)
         {
-            auto bar = juce::Rectangle<float> (bars.getX() + static_cast<float> (i) * (barWidth + gap),
-                                               bars.getY(), barWidth, bars.getHeight());
-            g.setColour (juce::Colour (0xff111820));
-            g.fillRect (bar);
-            g.setColour (juce::Colour (0xff3a4652));
-            g.drawRect (bar, 1.0f);
+            return value <= -99.0f ? "-inf" + suffix : juce::String (value, 1) + suffix;
+        };
+        const auto autoGainAbs = std::abs (snapshot.autoGainDb);
+        const auto autoColour = autoGainAbs > 12.0f ? juce::Colour (0xffff5a5f)
+                              : autoGainAbs > 6.0f  ? juce::Colour (0xffffb84d)
+                                                    : juce::Colour (0xff54cdff);
+        const auto meterValueColour = [&] (size_t stage)
+        {
+            if (stage == 0)
+                return snapshot.inputClipped ? juce::Colour (0xffff5a5f) : mutedColour();
+            if (stage == 1)
+                return autoColour;
+            return snapshot.outputClipped ? juce::Colour (0xffff5a5f) : mutedColour();
+        };
 
-            const auto level = juce::jlimit (0.0f, 1.0f, juce::jmap (values[i], -60.0f, 0.0f, 0.0f, 1.0f));
-            auto fill = bar;
-            fill.removeFromTop (fill.getHeight() * (1.0f - level));
-            juce::ColourGradient gradient (juce::Colour (0xff46d5bd), fill.getBottomLeft(),
-                                           juce::Colour (0xfff5d34f), fill.getTopLeft(), false);
-            gradient.addColour (0.72, juce::Colour (0xff58dd62));
-            gradient.addColour (0.90, juce::Colour (0xffffa43a));
-            gradient.addColour (1.0, juce::Colour (0xffff4d52));
-            g.setGradientFill (gradient);
-            g.fillRect (fill);
+        g.setFont (juce::FontOptions (7.2f, juce::Font::bold));
+        for (size_t stage = 0; stage < stages.size(); ++stage)
+        {
+            const auto clipped = stage == 0 ? snapshot.inputClipped
+                               : stage == 1 ? snapshot.preAutoClipped
+                                            : snapshot.outputClipped;
+            const auto groupX = bars.getX() + static_cast<float> (stage) * (2.0f * barWidth + innerGap + groupGap);
+            for (int channel = 0; channel < 2; ++channel)
+            {
+                const auto x = groupX + static_cast<float> (channel) * (barWidth + innerGap);
+                auto bar = juce::Rectangle<float> (x, bars.getY(), barWidth, bars.getHeight());
+                g.setColour (juce::Colour (0xff111820));
+                g.fillRect (bar);
+                g.setColour (juce::Colour (0xff3a4652));
+                g.drawRect (bar, 1.0f);
 
-            const auto clipped = i < 2 ? snapshot.inputClipped
-                               : i < 4 ? snapshot.preAutoClipped
-                                       : snapshot.outputClipped;
-            g.setColour (clipped ? juce::Colour (0xffff4d52) : inkColour());
-            const auto valueText = values[i] <= -99.0f ? "-inf" : juce::String (values[i], 1);
-            g.drawFittedText (valueText, bar.toNearestInt().withY (static_cast<int> (bars.getY() - 1.0f)).withHeight (14),
-                              juce::Justification::centredTop, 1);
-            g.setColour (mutedColour());
-            g.drawText (labels[i], static_cast<int> (bar.getX()), static_cast<int> (bars.getBottom() + 3.0f),
-                        static_cast<int> (bar.getWidth()), 14, juce::Justification::centred);
+                const auto rmsDb = stages[stage][channel].rmsDb;
+                const auto peakDb = stages[stage][channel].peakDb;
+                const auto level = juce::jlimit (0.0f, 1.0f, juce::jmap (rmsDb, -60.0f, 0.0f, 0.0f, 1.0f));
+                auto fill = bar;
+                fill.removeFromTop (fill.getHeight() * (1.0f - level));
+                if (fill.getHeight() > 0.5f)
+                {
+                    juce::ColourGradient gradient (juce::Colour (0xff46d5bd), fill.getBottomLeft(),
+                                                   juce::Colour (0xffffd158), fill.getTopLeft(), false);
+                    gradient.addColour (0.70, juce::Colour (0xff5ee467));
+                    gradient.addColour (0.88, juce::Colour (0xffffa43a));
+                    gradient.addColour (1.0, juce::Colour (0xffff4d52));
+                    g.setGradientFill (gradient);
+                    g.fillRect (fill);
+                }
+
+                const auto peakY = juce::jmap (juce::jlimit (-60.0f, 0.0f, peakDb), -60.0f, 0.0f, bar.getBottom(), bar.getY());
+                g.setColour (clipped ? juce::Colour (0xffff4d52) : juce::Colour (0xfff4f7f8));
+                g.drawHorizontalLine (static_cast<int> (std::round (peakY)), bar.getX(), bar.getRight());
+
+                g.setColour (meterValueColour (stage));
+                g.drawFittedText (fmtDb (peakDb, ""),
+                                  bar.withY (bars.getY() - 10.0f).withHeight (9.0f).toNearestInt(),
+                                  juce::Justification::centred, 1, 0.45f);
+                g.setColour (mutedColour());
+                g.setFont (juce::FontOptions (8.0f, juce::Font::bold));
+                g.drawText (channel == 0 ? "L" : "R",
+                            static_cast<int> (bar.getX() - 1.0f), static_cast<int> (bar.getBottom() + 2.0f),
+                            static_cast<int> (bar.getWidth() + 2.0f), 12, juce::Justification::centred);
+                g.setFont (juce::FontOptions (7.2f, juce::Font::bold));
+            }
         }
 
-        const auto groupWidth = barWidth * 2.0f + gap;
         g.setColour (inkColour());
-        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
-        g.drawText ("IN", static_cast<int> (bars.getX()), static_cast<int> (bars.getBottom() + 18.0f),
-                    static_cast<int> (groupWidth), 15, juce::Justification::centred);
-        g.drawText ("PRE", static_cast<int> (bars.getX() + groupWidth + gap), static_cast<int> (bars.getBottom() + 18.0f),
-                    static_cast<int> (groupWidth), 15, juce::Justification::centred);
-        g.drawText ("OUT", static_cast<int> (bars.getX() + (groupWidth + gap) * 2.0f), static_cast<int> (bars.getBottom() + 18.0f),
-                    static_cast<int> (groupWidth), 15, juce::Justification::centred);
+        g.setFont (juce::FontOptions (9.5f, juce::Font::bold));
+        for (size_t stage = 0; stage < stageLabels.size(); ++stage)
+        {
+            const auto groupX = bars.getX() + static_cast<float> (stage) * (2.0f * barWidth + innerGap + groupGap);
+            g.drawText (stageLabels[stage],
+                        static_cast<int> (groupX),
+                        static_cast<int> (bars.getBottom() + 17.0f),
+                        static_cast<int> (2.0f * barWidth + innerGap), 13, juce::Justification::centred);
+        }
 
-        g.setFont (juce::FontOptions (9.5f));
-        g.setColour (snapshot.inputClipped || snapshot.preAutoClipped || snapshot.outputClipped
-                         ? juce::Colour (0xffff5a5f) : mutedColour());
-        const auto clipText = snapshot.inputClipped ? "  IN CLIP"
-                            : snapshot.preAutoClipped ? "  PRE CLIP"
-                            : snapshot.outputClipped ? "  OUT CLIP" : "";
-        g.drawFittedText ("Auto " + juce::String (snapshot.autoGainDb, 1) + " dB" + clipText,
-                          footer.toNearestInt(), juce::Justification::centredBottom, 1);
+        auto readouts = content.removeFromBottom (39.0f);
+        auto drawReadout = [&g] (juce::Rectangle<float> row, const juce::String& label,
+                                 juce::String value, juce::Colour colour)
+        {
+            g.setColour (colour);
+            g.setFont (juce::FontOptions (9.0f, juce::Font::bold));
+            g.drawText (label + " " + value, row, juce::Justification::centred);
+        };
+        const auto fmtSigned = [] (float value)
+        {
+            return juce::String (value >= 0.0f ? "+" : "") + juce::String (value, 1) + " dB";
+        };
+        const auto inputValue = snapshot.inputClipped
+            ? fmtSigned (snapshot.inputClipOverDb) + " CLIP"
+            : juce::String (snapshot.inputPeakDb, 1) + " dB";
+        const auto outputValue = snapshot.outputClipped
+            ? fmtSigned (snapshot.outputClipOverDb) + " CLIP"
+            : juce::String (snapshot.outputPeakDb, 1) + " dB";
+        auto autoValue = juce::String (snapshot.autoGainDb, 1) + " dB";
+        if (snapshot.preAutoClipped)
+            autoValue += "  PRE " + fmtSigned (snapshot.preAutoClipOverDb);
+
+        drawReadout (readouts.removeFromTop (13.0f), "IN", inputValue,
+                     snapshot.inputClipped ? juce::Colour (0xffff5a5f) : mutedColour());
+        drawReadout (readouts.removeFromTop (13.0f), "AUTO", autoValue, autoColour);
+        drawReadout (readouts.removeFromTop (13.0f), "OUT", outputValue,
+                     snapshot.outputClipped ? juce::Colour (0xffff5a5f) : mutedColour());
+    }
+
+    void resized() override
+    {
     }
 
 private:
@@ -2984,7 +3558,7 @@ public:
         const auto maxHeight = juce::jmax (410, owner.getHeight() - 320);
         owner.graphSectionHeight = juce::jlimit (410, maxHeight,
                                                  startHeight + event.getDistanceFromDragStartY());
-        owner.globalControlsWidth = juce::jlimit (540, juce::jmax (540, owner.getWidth() - 600),
+        owner.globalControlsWidth = juce::jlimit (720, juce::jmax (720, owner.getWidth() - 620),
                                                   startControlsWidth - event.getDistanceFromDragStartX());
         owner.resized();
     }
@@ -2992,7 +3566,7 @@ public:
 private:
     FlexCurveAudioProcessorEditor& owner;
     int startHeight = 430;
-    int startControlsWidth = 560;
+    int startControlsWidth = 720;
 };
 
 FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProcessor& p)
@@ -3002,7 +3576,7 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
     graphResizeHandle = std::make_unique<GraphResizeHandle> (*this);
     addAndMakeVisible (scaledContent);
     setResizable (true, true);
-    setResizeLimits (1008, 624, 2352, 1456);
+    setResizeLimits (900, 560, 3200, 2200);
     setSize (designWidth, designHeight);
 
     title.setText ("FlexCurve", juce::dontSendNotification);
@@ -3086,7 +3660,6 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
     addAndMakeVisible (zoomIn);
     addAndMakeVisible (zoomOut);
     addAndMakeVisible (zoomReset);
-    addAndMakeVisible (lockMode);
     addAndMakeVisible (undoButton);
     addAndMakeVisible (redoButton);
     addAndMakeVisible (smoothAll);
@@ -3133,28 +3706,40 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
 
     addAndMakeVisible (graph);
     graph.setViewRange (processor.getGlobalDbRange());
+    globalControlsViewport.setViewedComponent (&globalControlsContent, false);
+    globalControlsViewport.setScrollBarsShown (true, false);
+    globalControlsViewport.setScrollBarThickness (8);
+    styleScrollBar (globalControlsViewport.getVerticalScrollBar());
+    addAndMakeVisible (globalControlsViewport);
+    levelsViewport.setViewedComponent (&levelsContent, false);
+    levelsViewport.setScrollBarsShown (false, false);
+    levelsViewport.setScrollBarThickness (8);
+    styleScrollBar (levelsViewport.getVerticalScrollBar());
+    addAndMakeVisible (levelsViewport);
 
     styleSlider (dryWet);
     styleSlider (crossfeed);
+    styleSlider (globalBalance, " dB");
     styleSlider (gain, " dB");
     styleSlider (inputGain, " dB");
     styleSlider (outputGain, " dB");
     dryWet.setTooltip ("Blend latency-aligned dry audio with the corrected signal");
     crossfeed.setTooltip ("Reduce hard left/right separation for headphone listening");
+    globalBalance.setTooltip ("Final stereo balance trim. Negative shifts left, positive shifts right");
     gain.setTooltip ("Final monitoring gain. Never included in FIR rendering or export");
     inputGain.setTooltip ("Gain before correction and Input metering");
     outputGain.setTooltip ("Gain after correction and Auto Gain, before Global Gain");
 
-    for (auto* label : { &dryWetLabel, &crossfeedLabel, &gainLabel, &inputGainLabel, &outputGainLabel,
+    for (auto* label : { &dryWetLabel, &crossfeedLabel, &globalBalanceLabel, &gainLabel, &inputGainLabel, &outputGainLabel,
                          &phaseModeLabel, &globalControlsLabel })
     {
         label->setColour (juce::Label::textColourId, inkColour());
         label->setFont (juce::FontOptions (13.5f));
         label->setJustificationType (juce::Justification::centred);
-        addAndMakeVisible (*label);
     }
     dryWetLabel.setText ("Dry/Wet", juce::dontSendNotification);
     crossfeedLabel.setText ("Crossfeed", juce::dontSendNotification);
+    globalBalanceLabel.setText ("Balance", juce::dontSendNotification);
     gainLabel.setText ("Global Gain", juce::dontSendNotification);
     inputGainLabel.setText ("Input Gain", juce::dontSendNotification);
     outputGainLabel.setText ("Output Gain", juce::dontSendNotification);
@@ -3167,32 +3752,27 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
     phaseMode.addItem ("Linear", 3);
     phaseMode.setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff202832));
     phaseMode.setColour (juce::ComboBox::textColourId, inkColour());
-    addAndMakeVisible (phaseMode);
+    addAndMakeVisible (globalControlsLabel);
 
     styleToggle (limiter);
     styleToggle (bypass);
     styleToggle (autoGain);
     styleToggle (includeOutputGainFir);
     styleToggle (includeAutoGainFir);
+    styleToggle (independentLrPreamp);
     styleCombo (loudnessMatchMode);
+    styleButton (crossfeedAdvanced);
+    crossfeedAdvanced.setTooltip ("Open advanced crossfeed algorithm and geometry settings");
+    crossfeedAdvanced.onClick = [this] { openCrossfeedAdvanced(); };
     loudnessMatchMode.addItem ("Match Output to Input", 1);
     loudnessMatchMode.addItem ("Downward Match", 2);
     autoGain.setTooltip ("Slow transparent RMS level matching without compression or limiting");
     loudnessMatchMode.setTooltip ("Choose bidirectional matching or attenuation-only Downward Match");
     includeOutputGainFir.setTooltip ("Explicitly bake Output Gain into exported FIR files");
     includeAutoGainFir.setTooltip ("Explicitly bake the current learned Auto Gain into exported FIR files");
-    styleButton (resetMeters);
-    resetMeters.setTooltip ("Clear Peak/RMS and clipping displays without changing the audible Auto Gain");
-    resetMeters.onClick = [this] { processor.resetMeters(); };
-    addAndMakeVisible (*meterPanel);
+    independentLrPreamp.setTooltip (
+        "Advanced: calculate separate safe AutoEQ preamps for L and R. This can change stereo balance.");
     addAndMakeVisible (*graphResizeHandle);
-    addAndMakeVisible (limiter);
-    addAndMakeVisible (bypass);
-    addAndMakeVisible (autoGain);
-    addAndMakeVisible (loudnessMatchMode);
-    addAndMakeVisible (includeOutputGainFir);
-    addAndMakeVisible (includeAutoGainFir);
-    addAndMakeVisible (resetMeters);
 
     blendTab = std::make_unique<BlendTab> (processor);
     graphicTab = std::make_unique<GraphicTab> (processor, graph);
@@ -3208,6 +3788,7 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
 
     dryWetAttachment = std::make_unique<SliderAttachment> (processor.parameters, "drywet", dryWet);
     crossfeedAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeed", crossfeed);
+    globalBalanceAttachment = std::make_unique<SliderAttachment> (processor.parameters, "globalbalance", globalBalance);
     gainAttachment = std::make_unique<SliderAttachment> (processor.parameters, "gain", gain);
     inputGainAttachment = std::make_unique<SliderAttachment> (processor.parameters, "inputgain", inputGain);
     outputGainAttachment = std::make_unique<SliderAttachment> (processor.parameters, "outputgain", outputGain);
@@ -3221,12 +3802,41 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
         processor.parameters, "includeoutputgainfir", includeOutputGainFir);
     includeAutoGainFirAttachment = std::make_unique<ButtonAttachment> (
         processor.parameters, "includeautogainfir", includeAutoGainFir);
+    independentLrPreampAttachment = std::make_unique<ButtonAttachment> (
+        processor.parameters, "independentlrpreamp", independentLrPreamp);
 
     installSliderReset (dryWet, 1.0);
     installSliderReset (crossfeed, 0.0);
+    installSliderReset (globalBalance, 0.0);
     installSliderReset (gain, 0.0);
     installSliderReset (inputGain, 0.0);
     installSliderReset (outputGain, 0.0);
+
+    for (auto* child : { static_cast<juce::Component*> (&dryWet),
+                         static_cast<juce::Component*> (&crossfeed),
+                         static_cast<juce::Component*> (&globalBalance),
+                         static_cast<juce::Component*> (&gain),
+                         static_cast<juce::Component*> (&inputGain),
+                         static_cast<juce::Component*> (&outputGain),
+                         static_cast<juce::Component*> (&dryWetLabel),
+                         static_cast<juce::Component*> (&crossfeedLabel),
+                         static_cast<juce::Component*> (&globalBalanceLabel),
+                         static_cast<juce::Component*> (&gainLabel),
+                         static_cast<juce::Component*> (&inputGainLabel),
+                         static_cast<juce::Component*> (&outputGainLabel),
+                         static_cast<juce::Component*> (&phaseModeLabel),
+                         static_cast<juce::Component*> (&phaseMode),
+                         static_cast<juce::Component*> (&autoGain),
+                         static_cast<juce::Component*> (&loudnessMatchMode),
+                         static_cast<juce::Component*> (&crossfeedAdvanced),
+                         static_cast<juce::Component*> (&lockMode),
+                         static_cast<juce::Component*> (&limiter),
+                         static_cast<juce::Component*> (&bypass),
+                         static_cast<juce::Component*> (&includeOutputGainFir),
+                         static_cast<juce::Component*> (&includeAutoGainFir),
+                         static_cast<juce::Component*> (&independentLrPreamp) })
+        globalControlsContent.addAndMakeVisible (*child);
+    levelsContent.addAndMakeVisible (*meterPanel);
 
     updatePresetCombo();
     updateActiveLayerCombo();
@@ -3242,6 +3852,11 @@ FlexCurveAudioProcessorEditor::~FlexCurveAudioProcessorEditor()
 
     presetCombo.onChange = nullptr;
     chooser.reset();
+
+    globalControlsViewport.setViewedComponent (nullptr, false);
+    levelsViewport.setViewedComponent (nullptr, false);
+    globalControlsContent.removeAllChildren();
+    levelsContent.removeAllChildren();
 
     // TabbedComponent does not own these pages. Detach them before the
     // unique_ptrs are destroyed so JUCE never sees stale page pointers.
@@ -3264,7 +3879,18 @@ void FlexCurveAudioProcessorEditor::styleSlider (juce::Slider& slider, const juc
     slider.setColour (juce::Slider::rotarySliderOutlineColourId, juce::Colour (0xff465360));
     slider.setColour (juce::Slider::textBoxTextColourId, inkColour());
     slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-    addAndMakeVisible (slider);
+}
+
+void FlexCurveAudioProcessorEditor::openCrossfeedAdvanced()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.content.setOwned (new CrossfeedAdvancedComponent (processor));
+    options.dialogTitle = "Advanced Crossfeed";
+    options.dialogBackgroundColour = panelColour();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = false;
+    options.launchAsync();
 }
 
 void FlexCurveAudioProcessorEditor::paint (juce::Graphics& g)
@@ -3295,112 +3921,131 @@ void FlexCurveAudioProcessorEditor::applyUiScalePreset (float scale)
 
 void FlexCurveAudioProcessorEditor::resized()
 {
-    const auto scale = juce::jmin (static_cast<float> (getWidth()) / static_cast<float> (designWidth),
-                                  static_cast<float> (getHeight()) / static_cast<float> (designHeight));
-    const auto scaledWidth = static_cast<float> (designWidth) * scale;
-    const auto scaledHeight = static_cast<float> (designHeight) * scale;
-    const auto offsetX = (static_cast<float> (getWidth()) - scaledWidth) * 0.5f;
-    const auto offsetY = (static_cast<float> (getHeight()) - scaledHeight) * 0.5f;
-    scaledContent.setBounds (0, 0, designWidth, designHeight);
-    scaledContent.setTransform (juce::AffineTransform::scale (scale).translated (offsetX, offsetY));
+    const auto savedScalePercent = static_cast<int> (processor.parameters.state.getProperty ("uiScalePercent", 100));
+    const auto scale = static_cast<float> (juce::jlimit (60, 140, savedScalePercent)) / 100.0f;
+    const auto logicalWidth = juce::jmax (designWidth, juce::roundToInt (static_cast<float> (getWidth()) / scale));
+    const auto logicalHeight = juce::jmax (designHeight, juce::roundToInt (static_cast<float> (getHeight()) / scale));
+    scaledContent.setBounds (0, 0, logicalWidth, logicalHeight);
+    scaledContent.setTransform (juce::AffineTransform::scale (scale));
 
-    auto area = juce::Rectangle<int> (0, 0, designWidth, designHeight).reduced (22);
-    auto header = area.removeFromTop (126);
-    auto firstRow = header.removeFromTop (38);
-    title.setBounds (firstRow.removeFromLeft (210));
-    presetCombo.setBounds (firstRow.removeFromLeft (220).withHeight (34).translated (0, 3));
-    firstRow.removeFromLeft (12);
-    help.setBounds (firstRow.removeFromRight (74).withHeight (36).translated (0, 2));
-    firstRow.removeFromRight (10);
-    status.setBounds (firstRow.translated (0, 8));
+    auto area = juce::Rectangle<int> (0, 0, logicalWidth, logicalHeight).reduced (18);
+    auto header = area.removeFromTop (132);
+    auto commandRow = header.removeFromTop (42);
+    title.setBounds (commandRow.removeFromLeft (210));
+    presetCombo.setBounds (commandRow.removeFromLeft (220).withHeight (34).translated (0, 3));
+    commandRow.removeFromLeft (8);
+    newFlat.setBounds (commandRow.removeFromLeft (190).withHeight (32).translated (0, 3));
+    commandRow.removeFromLeft (6);
+    addCurve.setBounds (commandRow.removeFromLeft (220).withHeight (32).translated (0, 3));
+    commandRow.removeFromLeft (6);
+    renderFir.setBounds (commandRow.removeFromLeft (104).withHeight (32).translated (0, 3));
+    commandRow.removeFromLeft (6);
+    exportFir.setBounds (commandRow.removeFromLeft (104).withHeight (32).translated (0, 3));
+    commandRow.removeFromLeft (6);
+    resetFlat.setBounds (commandRow.removeFromLeft (150).withHeight (30).translated (0, 4));
+    commandRow.removeFromLeft (6);
+    resetAll.setBounds (commandRow.removeFromLeft (90).withHeight (30).translated (0, 4));
+    commandRow.removeFromLeft (6);
+    smoothAll.setBounds (commandRow.removeFromLeft (152).withHeight (30).translated (0, 4));
 
-    auto actionRow = header.removeFromTop (36);
-    newFlat.setBounds (actionRow.removeFromLeft (190).withHeight (32));
-    actionRow.removeFromLeft (8);
-    addCurve.setBounds (actionRow.removeFromLeft (220).withHeight (32));
-    actionRow.removeFromLeft (8);
-    renderFir.setBounds (actionRow.removeFromLeft (104).withHeight (32));
-    actionRow.removeFromLeft (8);
-    exportFir.setBounds (actionRow.removeFromLeft (104).withHeight (32));
-    actionRow.removeFromLeft (14);
-    resetFlat.setBounds (actionRow.removeFromLeft (150).withHeight (30));
-    actionRow.removeFromLeft (8);
-    resetAll.setBounds (actionRow.removeFromLeft (90).withHeight (30));
-    uiScale.setBounds (actionRow.removeFromRight (82).withHeight (30));
-    uiScaleLabel.setBounds (actionRow.removeFromRight (62).withHeight (30));
-
-    auto secondRow = header.removeFromTop (34);
-    zoomReset.setBounds (secondRow.removeFromRight (48).withHeight (28));
-    secondRow.removeFromRight (4);
-    zoomIn.setBounds (secondRow.removeFromRight (30).withHeight (28));
-    secondRow.removeFromRight (4);
-    zoomOut.setBounds (secondRow.removeFromRight (30).withHeight (28));
-    secondRow.removeFromRight (10);
-    dbScale.setBounds (secondRow.removeFromRight (112).withHeight (28));
-    dbScaleLabel.setBounds (secondRow.removeFromRight (108).withHeight (28));
-    secondRow.removeFromRight (10);
-    redoButton.setBounds (secondRow.removeFromRight (32).withHeight (28));
-    secondRow.removeFromRight (4);
-    undoButton.setBounds (secondRow.removeFromRight (32).withHeight (28));
-    secondRow.removeFromRight (6);
-    smoothAll.setBounds (secondRow.removeFromRight (154).withHeight (28));
-    secondRow.removeFromRight (10);
-    const auto maxActiveLabelWidth = juce::jmax (220, secondRow.getWidth() - 80);
+    auto toolRow = header.removeFromTop (34);
+    help.setBounds (toolRow.removeFromRight (74).withHeight (32).translated (0, 1));
+    toolRow.removeFromRight (10);
+    zoomReset.setBounds (toolRow.removeFromRight (48).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (4);
+    zoomIn.setBounds (toolRow.removeFromRight (30).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (4);
+    zoomOut.setBounds (toolRow.removeFromRight (30).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (10);
+    uiScale.setBounds (toolRow.removeFromRight (82).withHeight (30).translated (0, 2));
+    uiScaleLabel.setBounds (toolRow.removeFromRight (58).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (10);
+    dbScale.setBounds (toolRow.removeFromRight (108).withHeight (30).translated (0, 2));
+    dbScaleLabel.setBounds (toolRow.removeFromRight (92).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (8);
+    redoButton.setBounds (toolRow.removeFromRight (32).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (4);
+    undoButton.setBounds (toolRow.removeFromRight (32).withHeight (30).translated (0, 2));
+    toolRow.removeFromRight (14);
+    status.setBounds (toolRow.removeFromRight (juce::jmin (520, juce::jmax (320, toolRow.getWidth() / 2))).withHeight (24).translated (0, 4));
+    const auto maxActiveLabelWidth = juce::jmax (260, toolRow.getWidth());
     const auto desiredActiveLabelWidth = 24 + activeLayerLabel.getText().length() * 8;
-    const auto activeLabelWidth = juce::jlimit (220, maxActiveLabelWidth, desiredActiveLabelWidth);
-    activeLayerLabel.setBounds (secondRow.removeFromLeft (activeLabelWidth));
+    const auto activeLabelWidth = juce::jlimit (260, maxActiveLabelWidth, desiredActiveLabelWidth);
+    activeLayerLabel.setBounds (toolRow.removeFromLeft (activeLabelWidth).withHeight (24).translated (0, 4));
 
-    auto rackRow = header.removeFromTop (36);
+    header.removeFromTop (4);
+    auto rackRow = header.removeFromTop (42);
     if (globalLayerRack != nullptr)
         globalLayerRack->setBounds (rackRow);
 
     const auto maxGraphHeight = juce::jmax (410, area.getHeight() - 180);
     graphSectionHeight = juce::jlimit (410, maxGraphHeight, graphSectionHeight);
-    globalControlsWidth = juce::jlimit (540, juce::jmax (540, area.getWidth() - 600), globalControlsWidth);
+    globalControlsWidth = juce::jlimit (720, juce::jmax (720, area.getWidth() - 620), globalControlsWidth);
     auto top = area.removeFromTop (graphSectionHeight);
-    auto controls = top.removeFromRight (globalControlsWidth);
+    auto rightPanel = top.removeFromRight (globalControlsWidth);
     top.removeFromRight (10);
     const auto graphBounds = top.reduced (0, 6);
     graph.setBounds (graphBounds);
     graphResizeHandle->setBounds (graphBounds.getRight() - 10, graphBounds.getBottom() - 10, 22, 22);
     graphResizeHandle->toFront (false);
 
-    globalControlsLabel.setBounds (controls.removeFromTop (22));
-    auto meterArea = controls.removeFromRight (200);
-    meterPanel->setBounds (meterArea.reduced (5, 0));
-    controls.removeFromRight (8);
+    auto levelsArea = rightPanel.removeFromRight (190);
+    rightPanel.removeFromRight (8);
+    auto controls = rightPanel;
+    globalControlsLabel.setBounds (controls.removeFromTop (20));
+    globalControlsViewport.setBounds (controls);
+    levelsViewport.setBounds (levelsArea);
+    const auto contentWidth = juce::jmax (500, controls.getWidth() - 10);
+    const auto contentHeight = 460;
+    globalControlsContent.setBounds (0, 0, contentWidth, contentHeight);
+    auto controlsContent = juce::Rectangle<int> (0, 0, contentWidth, contentHeight).reduced (4, 0);
+    const auto levelsWidth = juce::jmax (172, levelsArea.getWidth() - 10);
+    const auto levelsHeight = levelsArea.getHeight();
+    levelsContent.setBounds (0, 0, levelsWidth, levelsHeight);
+    auto levelsContentArea = juce::Rectangle<int> (0, 0, levelsWidth, levelsHeight).reduced (3, 0);
 
     auto setKnob = [] (juce::Rectangle<int> cell, juce::Slider& slider, juce::Label& label)
     {
-        auto labelArea = cell.removeFromBottom (22);
-        slider.setBounds (cell);
+        auto labelArea = cell.removeFromBottom (20);
+        slider.setBounds (cell.reduced (0, 0));
         label.setBounds (labelArea);
     };
-    constexpr int knobHeight = 110;
-    auto firstKnobs = controls.removeFromTop (knobHeight);
-    const auto firstCellWidth = firstKnobs.getWidth() / 3;
-    setKnob (firstKnobs.removeFromLeft (firstCellWidth), dryWet, dryWetLabel);
-    setKnob (firstKnobs.removeFromLeft (firstCellWidth), crossfeed, crossfeedLabel);
-    setKnob (firstKnobs, gain, gainLabel);
-    auto secondKnobs = controls.removeFromTop (knobHeight);
-    const auto secondCellWidth = secondKnobs.getWidth() / 3;
-    setKnob (secondKnobs.removeFromLeft (secondCellWidth), inputGain, inputGainLabel);
-    setKnob (secondKnobs.removeFromLeft (secondCellWidth), outputGain, outputGainLabel);
-    auto gainOptions = secondKnobs.reduced (4, 2);
-    autoGain.setBounds (gainOptions.removeFromTop (24));
-    loudnessMatchMode.setBounds (gainOptions.removeFromTop (30));
-    resetMeters.setBounds (gainOptions.removeFromTop (26));
+    constexpr int knobHeight = 108;
+    auto monitorKnobs = controlsContent.removeFromTop (knobHeight);
+    const auto monitorCellWidth = monitorKnobs.getWidth() / 3;
+    setKnob (monitorKnobs.removeFromLeft (monitorCellWidth), dryWet, dryWetLabel);
+    setKnob (monitorKnobs.removeFromLeft (monitorCellWidth), crossfeed, crossfeedLabel);
+    setKnob (monitorKnobs, globalBalance, globalBalanceLabel);
 
-    controls.removeFromTop (4);
-    phaseModeLabel.setBounds (controls.removeFromTop (18));
-    phaseMode.setBounds (controls.removeFromTop (30));
-    controls.removeFromTop (4);
-    auto switches = controls.removeFromTop (28);
-    lockMode.setBounds (switches.removeFromLeft (74));
-    limiter.setBounds (switches.removeFromLeft (78));
-    bypass.setBounds (switches.removeFromLeft (82));
-    includeOutputGainFir.setBounds (controls.removeFromTop (20));
-    includeAutoGainFir.setBounds (controls.removeFromTop (20));
+    auto advancedRow = controlsContent.removeFromTop (24).reduced (18, 0);
+    crossfeedAdvanced.setBounds (advancedRow.withSizeKeepingCentre (juce::jmin (142, advancedRow.getWidth()), 24));
+
+    controlsContent.removeFromTop (0);
+    auto gainKnobs = controlsContent.removeFromTop (knobHeight);
+    const auto gainCellWidth = gainKnobs.getWidth() / 3;
+    setKnob (gainKnobs.removeFromLeft (gainCellWidth), gain, gainLabel);
+    setKnob (gainKnobs.removeFromLeft (gainCellWidth), inputGain, inputGainLabel);
+    setKnob (gainKnobs, outputGain, outputGainLabel);
+
+    controlsContent.removeFromTop (2);
+    auto gainOptions = controlsContent.removeFromTop (56).reduced (18, 0);
+    autoGain.setBounds (gainOptions.removeFromTop (22));
+    gainOptions.removeFromTop (2);
+    loudnessMatchMode.setBounds (gainOptions.removeFromTop (28));
+
+    controlsContent.removeFromTop (2);
+    phaseModeLabel.setBounds (controlsContent.removeFromTop (16));
+    phaseMode.setBounds (controlsContent.removeFromTop (28));
+    controlsContent.removeFromTop (3);
+    auto switches = controlsContent.removeFromTop (28);
+    lockMode.setBounds (switches.removeFromLeft (74).withHeight (28));
+    limiter.setBounds (switches.removeFromLeft (78).withHeight (28));
+    bypass.setBounds (switches.removeFromLeft (82).withHeight (28));
+    includeOutputGainFir.setBounds (controlsContent.removeFromTop (20));
+    includeAutoGainFir.setBounds (controlsContent.removeFromTop (20));
+    independentLrPreamp.setBounds (controlsContent.removeFromTop (20));
+
+    meterPanel->setBounds (levelsContentArea.reduced (0, 2));
 
     area.removeFromTop (10);
     tabs.setBounds (area);
@@ -3462,7 +4107,12 @@ void FlexCurveAudioProcessorEditor::updateActiveLayerCombo()
         name = "Average (read-only)";
     else if (const auto it = std::find_if (layers.begin(), layers.end(), [currentId] (const auto& layer) { return layer.id == currentId; });
              it != layers.end())
-        name = it->name;
+    {
+        const auto channel = it->selectedChannel == FlexChannelSelection::left ? "L"
+                           : it->selectedChannel == FlexChannelSelection::right ? "R" : "L+R";
+        name = it->name + " [" + channel + "]"
+             + (it->channelsLinked ? " linked" : "");
+    }
 
     const auto text = "Active Layer: " + name;
     if (activeLayerLabel.getText() != text)

@@ -13,8 +13,12 @@ struct CurvePoint
 struct ParsedCurveData
 {
     std::vector<CurvePoint> points;
+    std::vector<CurvePoint> rightPoints;
     double gainDb = 0.0;
+    double rightGainDb = 0.0;
     bool hasExplicitGain = false;
+    bool hasExplicitRightGain = false;
+    bool hasIndependentRightChannel = false;
 };
 
 class CurveFIR

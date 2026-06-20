@@ -12,6 +12,11 @@ _build_verify/
 !LICENSE
 !README.md
 !THIRD_PARTY_NOTICES.md
+!build_flexcurve.ps1
+!build_flexcurve.bat
+!scripts/
+!scripts/build-flexcurve-vst3.ps1
+!scripts/build-flexcurve-vst3.bat
 !assets/
 !assets/**
 

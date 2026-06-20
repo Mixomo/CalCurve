@@ -162,10 +162,25 @@ namespace
         return name.isNotEmpty() ? name : "Imported Curve";
     }
 
+    float channelBalanceOffsetDb (float balanceDb, FlexChannelSelection channel)
+    {
+        const auto limited = juce::jlimit (-24.0f, 24.0f, balanceDb);
+        if (channel == FlexChannelSelection::right)
+            return limited * 0.5f;
+        return -limited * 0.5f;
+    }
+
+    double dbToGain (double db)
+    {
+        return std::pow (10.0, db / 20.0);
+    }
+
     struct BufferPower
     {
         float peak = 0.0f;
         double meanSquare = 0.0;
+        std::array<float, 3> channelPeak {};
+        std::array<double, 3> channelMeanSquare {};
     };
 
     BufferPower measureBufferPower (const juce::AudioBuffer<float>& buffer)
@@ -173,19 +188,37 @@ namespace
         BufferPower result;
         double sum = 0.0;
         juce::int64 count = 0;
+        std::array<double, 2> channelSum {};
+        std::array<juce::int64, 2> channelCount {};
         for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
         {
             const auto* data = buffer.getReadPointer (channel);
+            const auto meterChannel = juce::jlimit (0, 1, channel);
             for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
             {
                 const auto value = data[sample];
-                result.peak = juce::jmax (result.peak, std::abs (value));
+                const auto absValue = std::abs (value);
+                result.peak = juce::jmax (result.peak, absValue);
+                result.channelPeak[static_cast<size_t> (meterChannel)] = juce::jmax (
+                    result.channelPeak[static_cast<size_t> (meterChannel)], absValue);
                 sum += static_cast<double> (value) * value;
+                channelSum[static_cast<size_t> (meterChannel)] += static_cast<double> (value) * value;
+                ++channelCount[static_cast<size_t> (meterChannel)];
                 ++count;
             }
         }
         result.meanSquare = count > 0 ? sum / static_cast<double> (count) : 0.0;
+        for (size_t channel = 0; channel < 2; ++channel)
+            result.channelMeanSquare[channel] = channelCount[channel] > 0
+                ? channelSum[channel] / static_cast<double> (channelCount[channel]) : 0.0;
+        result.channelPeak[2] = result.peak;
+        result.channelMeanSquare[2] = result.meanSquare;
         return result;
+    }
+
+    float approximateLufsFromRmsDb (float rmsDb)
+    {
+        return rmsDb <= -99.0f ? -100.0f : rmsDb - 0.7f;
     }
 }
 
@@ -198,6 +231,7 @@ FlexCurveAudioProcessor::FlexCurveAudioProcessor()
     parameters.addParameterListener ("phasemode", this);
     parameters.addParameterListener ("autogain", this);
     parameters.addParameterListener ("loudnessmatchmode", this);
+    resetMeters();
 }
 
 FlexCurveAudioProcessor::~FlexCurveAudioProcessor()
@@ -225,9 +259,33 @@ juce::AudioProcessorValueTreeState::ParameterLayout FlexCurveAudioProcessor::cre
         juce::AudioProcessorParameter::genericParameter,
         [] (float val, int) { return juce::String (juce::roundToInt (val * 100.0f)) + " %"; },
         [] (const juce::String& text) { return static_cast<float> (text.getDoubleValue() / 100.0); }));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> (
+        "crossfeedalgorithm", "Crossfeed Algorithm", juce::StringArray { "Natural", "BS2B" }, 0));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedcircumference", "Crossfeed Head Circumference",
+        juce::NormalisableRange<float> (45.0f, 70.0f, 0.1f), 57.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedheadwidth", "Crossfeed Head Width",
+        juce::NormalisableRange<float> (10.0f, 22.0f, 0.1f), 15.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedheadlength", "Crossfeed Head Length",
+        juce::NormalisableRange<float> (14.0f, 25.0f, 0.1f), 19.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedangle", "Crossfeed Speaker Angle",
+        juce::NormalisableRange<float> (10.0f, 90.0f, 0.1f), 60.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedcutoff", "Crossfeed Cutoff",
+        juce::NormalisableRange<float> (200.0f, 2500.0f, 1.0f), 700.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeeddirect", "Crossfeed Direct",
+        juce::NormalisableRange<float> (50.0f, 120.0f, 0.1f), 100.0f));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
         "gain", "Gain", juce::NormalisableRange<float> (-96.0f, 96.0f, 0.01f), 0.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "globalbalance", "Global Balance",
+        juce::NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f,
+        " dB"));
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
         "inputgain", "Input Gain", juce::NormalisableRange<float> (-36.0f, 36.0f, 0.01f), 0.0f));
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
@@ -240,6 +298,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout FlexCurveAudioProcessor::cre
         "includeoutputgainfir", "Include Output Gain in FIR Export", false));
     params.push_back (std::make_unique<juce::AudioParameterBool> (
         "includeautogainfir", "Include Auto Gain in FIR Export", false));
+    params.push_back (std::make_unique<juce::AudioParameterBool> (
+        "independentlrpreamp", "Use Independent L/R AutoEQ Preamp", false));
 
     params.push_back (std::make_unique<juce::AudioParameterChoice> (
         "phasemode", "Phase Mode", juce::StringArray { "Minimum", "Natural", "Linear" }, 0));
@@ -267,7 +327,7 @@ void FlexCurveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBl
     dryDelayBuffer.clear();
     dryDelayWriteIndex = 0;
 
-    crossfeedDelay.setSize (2, juce::jmax (32, static_cast<int> (std::ceil (sampleRate * 0.001))));
+    crossfeedDelay.setSize (2, juce::jmax (32, static_cast<int> (std::ceil (sampleRate * 0.003))));
     resetCrossfeed();
     limiterGain = 1.0f;
     previewFiltersDirty = true;
@@ -321,6 +381,7 @@ void FlexCurveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
 
     const auto dryWet = parameters.getRawParameterValue ("drywet")->load();
     const auto crossfeed = parameters.getRawParameterValue ("crossfeed")->load();
+    const auto globalBalanceDb = parameters.getRawParameterValue ("globalbalance")->load();
     const auto inputGain = juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("inputgain")->load());
     const auto outputGain = juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("outputgain")->load());
     const auto globalGain = juce::Decibels::decibelsToGain (parameters.getRawParameterValue ("gain")->load());
@@ -353,6 +414,7 @@ void FlexCurveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
             dryDelayWriteIndex = (dryDelayWriteIndex + numSamples) % dryDelayBuffer.getNumSamples();
         }
 
+        applyGlobalBalance (buffer, globalBalanceDb);
         buffer.applyGain (outputGain * globalGain);
         if (limiterEnabled)
         {
@@ -419,6 +481,8 @@ void FlexCurveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     if (crossfeed > 0.0f)
         applyCrossfeed (buffer, crossfeed);
 
+    applyGlobalBalance (buffer, globalBalanceDb);
+
     const auto preAutoStats = measureBufferPower (buffer);
     const auto downstreamGain = outputGain * globalGain;
     const auto preAutoPeak = preAutoStats.peak * downstreamGain;
@@ -432,8 +496,23 @@ void FlexCurveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     };
     updatePreAutoBallistic (preAutoPeakDb, preAutoPeakValueDb);
     updatePreAutoBallistic (preAutoRmsDb, preAutoRmsValueDb);
-    if (preAutoPeak > 1.0f)
-        preAutoClip.store (true);
+    for (size_t channel = 0; channel < 3; ++channel)
+    {
+        const auto channelPeakDb = juce::Decibels::gainToDecibels (
+            preAutoStats.channelPeak[channel] * downstreamGain, -100.0f);
+        const auto channelRmsDb = juce::Decibels::gainToDecibels (
+            static_cast<float> (std::sqrt (juce::jmax (0.0, preAutoStats.channelMeanSquare[channel]))) * downstreamGain, -100.0f);
+        const auto channelLufs = approximateLufsFromRmsDb (channelRmsDb);
+        updatePreAutoBallistic (preAutoChannelPeakDb[channel], channelPeakDb);
+        updatePreAutoBallistic (preAutoChannelRmsDb[channel], channelRmsDb);
+        updatePreAutoBallistic (preAutoChannelLufsMomentary[channel], channelLufs);
+        preAutoChannelLufsShortTerm[channel].store (
+            preAutoChannelLufsShortTerm[channel].load() * 0.94f + channelLufs * 0.06f);
+        preAutoChannelLufsIntegrated[channel].store (
+            preAutoChannelLufsIntegrated[channel].load() * 0.985f + channelLufs * 0.015f);
+    }
+    preAutoClip.store (preAutoPeak > 1.0f);
+    preAutoClipOverDb.store (preAutoPeak > 1.0f ? juce::Decibels::gainToDecibels (preAutoPeak, 0.0f) : 0.0f);
 
     updateRuntimeAutoGain (static_cast<float> (inputStats.meanSquare),
                            static_cast<float> (preAutoStats.meanSquare),
@@ -488,11 +567,29 @@ ParsedCurveData FlexCurveAudioProcessor::loadCurveData (const juce::File& file) 
             juce::AudioBuffer<float> impulse (static_cast<int> (reader->numChannels), static_cast<int> (reader->lengthInSamples));
             impulse.clear();
             reader->read (&impulse, 0, impulse.getNumSamples(), 0, true, true);
-            result.points = CurveFIR::createMagnitudeCurveFromImpulse (impulse, reader->sampleRate);
+            juce::AudioBuffer<float> leftImpulse (1, impulse.getNumSamples());
+            leftImpulse.copyFrom (0, 0, impulse, 0, 0, impulse.getNumSamples());
+            result.points = CurveFIR::createMagnitudeCurveFromImpulse (leftImpulse, reader->sampleRate);
+            if (impulse.getNumChannels() > 1)
+            {
+                juce::AudioBuffer<float> rightImpulse (1, impulse.getNumSamples());
+                rightImpulse.copyFrom (0, 0, impulse, 1, 0, impulse.getNumSamples());
+                result.rightPoints = CurveFIR::createMagnitudeCurveFromImpulse (rightImpulse, reader->sampleRate);
+                result.hasIndependentRightChannel = true;
+            }
+            else
+            {
+                result.rightPoints = result.points;
+            }
             result.hasExplicitGain = parseFlexCurveGainMetadata (reader->metadataValues, result.gainDb);
+            result.rightGainDb = result.gainDb;
             if (result.hasExplicitGain)
+            {
                 for (auto& point : result.points)
                     point.db -= result.gainDb;
+                for (auto& point : result.rightPoints)
+                    point.db -= result.rightGainDb;
+            }
         }
     }
     else
@@ -500,6 +597,107 @@ ParsedCurveData FlexCurveAudioProcessor::loadCurveData (const juce::File& file) 
         result = CurveFIR::parseCurveFileWithGain (file);
     }
     return result;
+}
+
+void FlexCurveAudioProcessor::copyLeftChannelToRight (FlexCurveLayer& layer)
+{
+    layer.right.autoEqMethod = layer.autoEqMethod;
+    layer.right.autoEqSourcesOutdated = layer.autoEqSourcesOutdated;
+    layer.right.autoEqReferenceOffsetDb = layer.autoEqReferenceOffsetDb;
+    layer.right.autoEqReferenceDisplayEnabled = layer.autoEqReferenceDisplayEnabled;
+    layer.right.points = layer.points;
+    layer.right.inverted = layer.inverted;
+    layer.right.gainDb = layer.gainDb;
+    layer.right.normalizationOffsetDb = layer.normalizationOffsetDb;
+    layer.right.smoothSourceCurve = layer.smoothSourceCurve;
+    layer.right.blend = layer.blend;
+    layer.right.graphicEnabled = layer.graphicEnabled;
+    layer.right.graphicMode = layer.graphicMode;
+    layer.right.preserveVariableShapeAcrossModes = layer.preserveVariableShapeAcrossModes;
+    layer.right.smoothGraphicCurve = layer.smoothGraphicCurve;
+    layer.right.graphic15Gains = layer.graphic15Gains;
+    layer.right.graphic31Gains = layer.graphic31Gains;
+    layer.right.paramBands = layer.paramBands;
+    layer.right.freeformPoints = layer.freeformPoints;
+}
+
+void FlexCurveAudioProcessor::copyRightChannelToLeft (FlexCurveLayer& layer)
+{
+    layer.autoEqMethod = layer.right.autoEqMethod;
+    layer.autoEqSourcesOutdated = layer.right.autoEqSourcesOutdated;
+    layer.autoEqReferenceOffsetDb = layer.right.autoEqReferenceOffsetDb;
+    layer.autoEqReferenceDisplayEnabled = layer.right.autoEqReferenceDisplayEnabled;
+    layer.points = layer.right.points;
+    layer.inverted = layer.right.inverted;
+    layer.gainDb = layer.right.gainDb;
+    layer.normalizationOffsetDb = layer.right.normalizationOffsetDb;
+    layer.smoothSourceCurve = layer.right.smoothSourceCurve;
+    layer.blend = layer.right.blend;
+    layer.graphicEnabled = layer.right.graphicEnabled;
+    layer.graphicMode = layer.right.graphicMode;
+    layer.preserveVariableShapeAcrossModes = layer.right.preserveVariableShapeAcrossModes;
+    layer.smoothGraphicCurve = layer.right.smoothGraphicCurve;
+    layer.graphic15Gains = layer.right.graphic15Gains;
+    layer.graphic31Gains = layer.right.graphic31Gains;
+    layer.paramBands = layer.right.paramBands;
+    layer.freeformPoints = layer.right.freeformPoints;
+}
+
+void FlexCurveAudioProcessor::loadRightChannelIntoLayerView (const FlexCurveLayer& source,
+                                                              FlexCurveLayer& destination)
+{
+    destination = source;
+    copyRightChannelToLeft (destination);
+}
+
+void FlexCurveAudioProcessor::saveLayerViewIntoRightChannel (const FlexCurveLayer& source,
+                                                              FlexCurveLayer& destination)
+{
+    auto copy = source;
+    copyLeftChannelToRight (copy);
+    destination.right = std::move (copy.right);
+}
+
+void FlexCurveAudioProcessor::applyToSelectedChannelsLocked (
+    FlexCurveLayer& layer, const std::function<void(FlexCurveLayer&)>& operation)
+{
+    if (layer.selectedChannel == FlexChannelSelection::stereo)
+    {
+        operation (layer);
+        if (layer.channelsLinked)
+            copyLeftChannelToRight (layer);
+        else
+        {
+            auto rightView = layer;
+            loadRightChannelIntoLayerView (layer, rightView);
+            operation (rightView);
+            saveLayerViewIntoRightChannel (rightView, layer);
+        }
+        return;
+    }
+
+    if (layer.channelsLinked)
+    {
+        copyLeftChannelToRight (layer);
+        layer.channelsLinked = false;
+    }
+
+    if (layer.selectedChannel == FlexChannelSelection::left)
+    {
+        operation (layer);
+        return;
+    }
+
+    auto rightView = layer;
+    loadRightChannelIntoLayerView (layer, rightView);
+    operation (rightView);
+    saveLayerViewIntoRightChannel (rightView, layer);
+}
+
+FlexChannelSelection FlexCurveAudioProcessor::getDisplayChannelLocked (const FlexCurveLayer& layer) const
+{
+    return layer.selectedChannel == FlexChannelSelection::right
+        ? FlexChannelSelection::right : FlexChannelSelection::left;
 }
 
 bool FlexCurveAudioProcessor::addCurveFile (const juce::File& file)
@@ -526,6 +724,14 @@ bool FlexCurveAudioProcessor::addCurveFile (const juce::File& file)
         layer.gainDb = static_cast<float> (imported.gainDb);
         layer.colour = nextLayerColour (layers);
         layer.paramBands.resize (8);
+        copyLeftChannelToRight (layer);
+        if (imported.hasIndependentRightChannel && ! imported.rightPoints.empty())
+        {
+            layer.right.points = std::move (imported.rightPoints);
+            layer.right.gainDb = static_cast<float> (
+                imported.hasExplicitRightGain ? imported.rightGainDb : imported.gainDb);
+            layer.channelsLinked = false;
+        }
         layers.push_back (std::move (layer));
         if (activeLayerId == 0)
             activeLayerId = layers.back().id;
@@ -561,6 +767,14 @@ bool FlexCurveAudioProcessor::addReferenceCurveFile (const juce::File& file, Fle
         layer.gainDb = static_cast<float> (imported.gainDb);
         layer.colour = nextLayerColour (layers);
         layer.paramBands.resize (8);
+        copyLeftChannelToRight (layer);
+        if (imported.hasIndependentRightChannel && ! imported.rightPoints.empty())
+        {
+            layer.right.points = std::move (imported.rightPoints);
+            layer.right.gainDb = static_cast<float> (
+                imported.hasExplicitRightGain ? imported.rightGainDb : imported.gainDb);
+            layer.channelsLinked = false;
+        }
         layers.push_back (std::move (layer));
         activeLayerId = layers.back().id;
         finalCurve = calculateFinalCurveLocked();
@@ -589,8 +803,10 @@ bool FlexCurveAudioProcessor::addFlatCurve()
         layer.muted = false;
         layer.solo = false;
         layer.gainDb = 0.0f;
+        layer.balanceDb = 0.0f;
         layer.opacity = 1.0f;
         layer.paramBands.resize (8);
+        copyLeftChannelToRight (layer);
         layers.push_back (std::move (layer));
         if (activeLayerId == 0)
             activeLayerId = layers.back().id;
@@ -769,11 +985,83 @@ void FlexCurveAudioProcessor::setLayerGain (int id, float gainDb)
         for (auto& layer : layers)
             if (layer.id == id)
             {
-                layer.gainDb = gainDb;
+                applyToSelectedChannelsLocked (layer, [gainDb] (auto& channel)
+                {
+                    channel.gainDb = gainDb;
+                });
                 if (layer.type != FlexCurveLayerType::eq)
                     markLinkedAutoEqLayersOutdatedLocked (layer.id);
             }
         finalCurve = calculateFinalCurveLocked();
+        finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
+    }
+    markPreviewDirty();
+}
+
+void FlexCurveAudioProcessor::setLayerBalance (int id, float balanceDb)
+{
+    if (editsBlocked())
+        return;
+
+    recordUndoState ("layer-balance-" + juce::String (id));
+    balanceDb = juce::jlimit (-24.0f, 24.0f, balanceDb);
+    {
+        const juce::ScopedLock lock (projectLock);
+        if (auto* layer = findLayer (id))
+        {
+            layer->balanceDb = balanceDb;
+            finalCurve = calculateFinalCurveLocked();
+            finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
+        }
+    }
+    markPreviewDirty();
+}
+
+void FlexCurveAudioProcessor::setLayerChannelSelection (int id, FlexChannelSelection channel)
+{
+    channel = static_cast<FlexChannelSelection> (
+        juce::jlimit (0, 2, static_cast<int> (channel)));
+    if (! editLocked.load())
+        recordUndoState ("layer-channel-" + juce::String (id));
+    const juce::ScopedLock lock (projectLock);
+    if (auto* layer = findLayer (id))
+        layer->selectedChannel = channel;
+}
+
+FlexChannelSelection FlexCurveAudioProcessor::getLayerChannelSelection (int id) const
+{
+    const juce::ScopedLock lock (projectLock);
+    if (const auto* layer = findLayer (id))
+        return layer->selectedChannel;
+    return FlexChannelSelection::stereo;
+}
+
+bool FlexCurveAudioProcessor::areLayerChannelsLinked (int id) const
+{
+    const juce::ScopedLock lock (projectLock);
+    if (const auto* layer = findLayer (id))
+        return layer->channelsLinked;
+    return true;
+}
+
+void FlexCurveAudioProcessor::linkLayerChannels (int id)
+{
+    if (editsBlocked())
+        return;
+
+    recordUndoState ("link-layer-channels-" + juce::String (id));
+    {
+        const juce::ScopedLock lock (projectLock);
+        if (auto* layer = findLayer (id))
+        {
+            if (layer->selectedChannel == FlexChannelSelection::right)
+                copyRightChannelToLeft (*layer);
+            copyLeftChannelToRight (*layer);
+            layer->channelsLinked = true;
+            layer->selectedChannel = FlexChannelSelection::stereo;
+            finalCurve = calculateFinalCurveLocked();
+            finalCurveRight = finalCurve;
+        }
     }
     markPreviewDirty();
 }
@@ -788,7 +1076,10 @@ void FlexCurveAudioProcessor::setLayerSourceSmoothing (int id, bool enabled)
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = findLayer (id))
         {
-            layer->smoothSourceCurve = enabled;
+            applyToSelectedChannelsLocked (*layer, [enabled] (auto& channel)
+            {
+                channel.smoothSourceCurve = enabled;
+            });
             if (layer->type != FlexCurveLayerType::eq)
                 markLinkedAutoEqLayersOutdatedLocked (layer->id);
         }
@@ -810,18 +1101,24 @@ void FlexCurveAudioProcessor::setGlobalDbRange (float rangeDb)
         const juce::ScopedLock lock (projectLock);
         for (auto& layer : layers)
         {
-            layer.gainDb = juce::jlimit (-next, next, layer.gainDb);
-            layer.blend.bassGainDb = juce::jlimit (-next, next, layer.blend.bassGainDb);
-            layer.blend.midGainDb = juce::jlimit (-next, next, layer.blend.midGainDb);
-            layer.blend.trebleGainDb = juce::jlimit (-next, next, layer.blend.trebleGainDb);
-            for (auto& gain : layer.graphic15Gains)
-                gain = juce::jlimit (-next, next, gain);
-            for (auto& gain : layer.graphic31Gains)
-                gain = juce::jlimit (-next, next, gain);
-            for (auto& band : layer.paramBands)
-                band.gainDb = juce::jlimit (-next, next, band.gainDb);
-            for (auto& point : layer.freeformPoints)
-                point.db = juce::jlimit (static_cast<double> (-next), static_cast<double> (next), point.db);
+            const auto selection = layer.selectedChannel;
+            layer.selectedChannel = FlexChannelSelection::stereo;
+            applyToSelectedChannelsLocked (layer, [next] (auto& channel)
+            {
+                channel.gainDb = juce::jlimit (-next, next, channel.gainDb);
+                channel.blend.bassGainDb = juce::jlimit (-next, next, channel.blend.bassGainDb);
+                channel.blend.midGainDb = juce::jlimit (-next, next, channel.blend.midGainDb);
+                channel.blend.trebleGainDb = juce::jlimit (-next, next, channel.blend.trebleGainDb);
+                for (auto& gain : channel.graphic15Gains)
+                    gain = juce::jlimit (-next, next, gain);
+                for (auto& gain : channel.graphic31Gains)
+                    gain = juce::jlimit (-next, next, gain);
+                for (auto& band : channel.paramBands)
+                    band.gainDb = juce::jlimit (-next, next, band.gainDb);
+                for (auto& point : channel.freeformPoints)
+                    point.db = juce::jlimit (static_cast<double> (-next), static_cast<double> (next), point.db);
+            });
+            layer.selectedChannel = selection;
         }
         globalBlend.bassGainDb = juce::jlimit (-next, next, globalBlend.bassGainDb);
         globalBlend.midGainDb = juce::jlimit (-next, next, globalBlend.midGainDb);
@@ -846,7 +1143,10 @@ void FlexCurveAudioProcessor::toggleLayerInverted (int id)
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = findLayer (id))
-            layer->inverted = ! layer->inverted;
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                channel.inverted = ! channel.inverted;
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -890,23 +1190,27 @@ void FlexCurveAudioProcessor::resetLayerEdits (int id)
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = findLayer (id))
         {
-            layer->gainDb = 0.0f;
-            layer->normalizationOffsetDb = 0.0f;
-            layer->inverted = false;
-            layer->blend = {};
             layer->muted = false;
             layer->enabled = true;
             layer->solo = false;
             layer->opacity = 1.0f;
-            layer->graphicEnabled = false;
-            layer->graphicMode = 31;
-            layer->preserveVariableShapeAcrossModes = false;
-            layer->smoothGraphicCurve = false;
-            layer->smoothSourceCurve = false;
-            layer->graphic15Gains.fill (0.0f);
-            layer->graphic31Gains.fill (0.0f);
-            layer->paramBands.assign (8, {});
-            layer->freeformPoints.clear();
+            layer->balanceDb = 0.0f;
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                channel.gainDb = 0.0f;
+                channel.normalizationOffsetDb = 0.0f;
+                channel.inverted = false;
+                channel.blend = {};
+                channel.graphicEnabled = false;
+                channel.graphicMode = 31;
+                channel.preserveVariableShapeAcrossModes = false;
+                channel.smoothGraphicCurve = false;
+                channel.smoothSourceCurve = false;
+                channel.graphic15Gains.fill (0.0f);
+                channel.graphic31Gains.fill (0.0f);
+                channel.paramBands.assign (8, {});
+                channel.freeformPoints.clear();
+            });
             if (layer->type != FlexCurveLayerType::eq)
                 markLinkedAutoEqLayersOutdatedLocked (layer->id);
             finalCurve = calculateFinalCurveLocked();
@@ -925,19 +1229,23 @@ void FlexCurveAudioProcessor::resetLayerToFlat (int id)
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = findLayer (id))
         {
-            layer->points = makeDefaultGrid();
-            layer->gainDb = 0.0f;
-            layer->normalizationOffsetDb = 0.0f;
-            layer->inverted = false;
-            layer->blend = {};
-            layer->graphic15Gains.fill (0.0f);
-            layer->graphic31Gains.fill (0.0f);
-            layer->freeformPoints.clear();
-            layer->paramBands.assign (8, {});
-            layer->graphicEnabled = false;
-            layer->preserveVariableShapeAcrossModes = false;
-            layer->smoothGraphicCurve = false;
-            layer->smoothSourceCurve = false;
+            layer->balanceDb = 0.0f;
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                channel.points = makeDefaultGrid();
+                channel.gainDb = 0.0f;
+                channel.normalizationOffsetDb = 0.0f;
+                channel.inverted = false;
+                channel.blend = {};
+                channel.graphic15Gains.fill (0.0f);
+                channel.graphic31Gains.fill (0.0f);
+                channel.freeformPoints.clear();
+                channel.paramBands.assign (8, {});
+                channel.graphicEnabled = false;
+                channel.preserveVariableShapeAcrossModes = false;
+                channel.smoothGraphicCurve = false;
+                channel.smoothSourceCurve = false;
+            });
             if (layer->type != FlexCurveLayerType::eq)
                 markLinkedAutoEqLayersOutdatedLocked (layer->id);
             finalCurve = calculateFinalCurveLocked();
@@ -956,19 +1264,25 @@ void FlexCurveAudioProcessor::resetAllLayerCurvesToFlat()
         const juce::ScopedLock lock (projectLock);
         for (auto& layer : layers)
         {
-            layer.points = makeDefaultGrid();
-            layer.gainDb = 0.0f;
-            layer.normalizationOffsetDb = 0.0f;
-            layer.inverted = false;
-            layer.blend = {};
-            layer.graphic15Gains.fill (0.0f);
-            layer.graphic31Gains.fill (0.0f);
-            layer.freeformPoints.clear();
-            layer.paramBands.assign (8, {});
-            layer.graphicEnabled = false;
-            layer.preserveVariableShapeAcrossModes = false;
-            layer.smoothGraphicCurve = false;
-            layer.smoothSourceCurve = false;
+            const auto selection = layer.selectedChannel;
+            layer.selectedChannel = FlexChannelSelection::stereo;
+            applyToSelectedChannelsLocked (layer, [] (auto& channel)
+            {
+                channel.points = makeDefaultGrid();
+                channel.gainDb = 0.0f;
+                channel.normalizationOffsetDb = 0.0f;
+                channel.inverted = false;
+                channel.blend = {};
+                channel.graphic15Gains.fill (0.0f);
+                channel.graphic31Gains.fill (0.0f);
+                channel.freeformPoints.clear();
+                channel.paramBands.assign (8, {});
+                channel.graphicEnabled = false;
+                channel.preserveVariableShapeAcrossModes = false;
+                channel.smoothGraphicCurve = false;
+                channel.smoothSourceCurve = false;
+            });
+            layer.selectedChannel = selection;
         }
         for (auto& layer : layers)
             if (layer.type == FlexCurveLayerType::eq && layer.autoEqRawLayerId > 0)
@@ -989,7 +1303,9 @@ void FlexCurveAudioProcessor::resetAll()
         const juce::ScopedLock lock (projectLock);
         layers.clear();
         finalCurve.clear();
+        finalCurveRight.clear();
         renderedCurve.clear();
+        renderedCurveRight.clear();
         nextLayerId = 1;
         activeLayerId = 0;
         averageEnabled = true;
@@ -1006,13 +1322,22 @@ void FlexCurveAudioProcessor::resetAll()
 
     if (auto* p = parameters.getParameter ("drywet")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("crossfeed")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeedalgorithm")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeedcircumference")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeedheadwidth")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeedheadlength")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeedangle")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeedcutoff")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("crossfeeddirect")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("gain")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("globalbalance")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("inputgain")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("outputgain")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("autogain")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("loudnessmatchmode")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("includeoutputgainfir")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("includeautogainfir")) p->setValueNotifyingHost (p->getDefaultValue());
+    if (auto* p = parameters.getParameter ("independentlrpreamp")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("phasemode")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("limiter")) p->setValueNotifyingHost (p->getDefaultValue());
     if (auto* p = parameters.getParameter ("bypass")) p->setValueNotifyingHost (p->getDefaultValue());
@@ -1133,7 +1458,16 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getLayerCurve (int id) const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = findLayer (id))
-        return calculateLayerCurveLocked (*layer);
+        return calculateLayerCurveLocked (*layer, getDisplayChannelLocked (*layer));
+    return {};
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::getLayerCurve (
+    int id, FlexChannelSelection channel) const
+{
+    const juce::ScopedLock lock (projectLock);
+    if (const auto* layer = findLayer (id))
+        return calculateLayerCurveLocked (*layer, channel);
     return {};
 }
 
@@ -1144,10 +1478,28 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getLayerCurveForDisplay (int id
     if (layer == nullptr)
         return {};
 
-    auto curve = calculateLayerCurveLocked (*layer);
+    auto curve = calculateLayerCurveLocked (*layer, getDisplayChannelLocked (*layer));
     if (layer->type == FlexCurveLayerType::raw || layer->type == FlexCurveLayerType::target)
     {
-        const auto displayOffset = getReferenceDisplayOffsetLocked (id);
+        const auto displayOffset = getReferenceDisplayOffsetLocked (
+            id, getDisplayChannelLocked (*layer));
+        for (auto& point : curve)
+            point.db += displayOffset;
+    }
+    return curve;
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::getLayerCurveForDisplay (
+    int id, FlexChannelSelection channel) const
+{
+    const juce::ScopedLock lock (projectLock);
+    const auto* layer = findLayer (id);
+    if (layer == nullptr)
+        return {};
+    auto curve = calculateLayerCurveLocked (*layer, channel);
+    if (layer->type == FlexCurveLayerType::raw || layer->type == FlexCurveLayerType::target)
+    {
+        const auto displayOffset = getReferenceDisplayOffsetLocked (id, channel);
         for (auto& point : curve)
             point.db += displayOffset;
     }
@@ -1158,7 +1510,7 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getLayerCurveWithoutFreeform (i
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = findLayer (id))
-        return calculateLayerCurveWithoutFreeformLocked (*layer);
+        return calculateLayerCurveWithoutFreeformLocked (*layer, getDisplayChannelLocked (*layer));
     return {};
 }
 
@@ -1168,10 +1520,39 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurve() const
     return finalCurve;
 }
 
+std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurve (
+    FlexChannelSelection channel) const
+{
+    const juce::ScopedLock lock (projectLock);
+    return calculateAverageCurveLocked (
+        channel == FlexChannelSelection::right ? FlexChannelSelection::right
+                                                : FlexChannelSelection::left);
+}
+
+bool FlexCurveAudioProcessor::averageChannelsDiffer() const
+{
+    const juce::ScopedLock lock (projectLock);
+    const auto left = calculateAverageCurveLocked (FlexChannelSelection::left);
+    const auto right = calculateAverageCurveLocked (FlexChannelSelection::right);
+    if (left.size() != right.size())
+        return true;
+    for (size_t i = 0; i < left.size(); ++i)
+        if (std::abs (left[i].db - right[i].db) > 1.0e-4)
+            return true;
+    return false;
+}
+
 std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurveForType (FlexCurveLayerType type) const
 {
     const juce::ScopedLock lock (projectLock);
     return calculateAverageCurveForTypeLocked (type);
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurveForType (
+    FlexCurveLayerType type, FlexChannelSelection channel) const
+{
+    const juce::ScopedLock lock (projectLock);
+    return calculateAverageCurveForTypeLocked (type, false, channel);
 }
 
 std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurveForTypeForDisplay (FlexCurveLayerType type) const
@@ -1180,14 +1561,22 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurveForTypeForDispla
     return calculateAverageCurveForTypeLocked (type, true);
 }
 
-std::vector<CurvePoint> FlexCurveAudioProcessor::calculateCorrectedMeasurementLocked (const FlexCurveLayer& eqLayer) const
+std::vector<CurvePoint> FlexCurveAudioProcessor::getAverageCurveForTypeForDisplay (
+    FlexCurveLayerType type, FlexChannelSelection channel) const
+{
+    const juce::ScopedLock lock (projectLock);
+    return calculateAverageCurveForTypeLocked (type, true, channel);
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::calculateCorrectedMeasurementLocked (
+    const FlexCurveLayer& eqLayer, FlexChannelSelection channel) const
 {
     const auto* raw = findLayer (eqLayer.autoEqRawLayerId);
     if (raw == nullptr || raw->type != FlexCurveLayerType::raw)
         return {};
 
-    const auto rawCurve = calculateLayerCurveLocked (*raw);
-    const auto eqCurve = calculateLayerCurveLocked (eqLayer);
+    const auto rawCurve = calculateLayerCurveLocked (*raw, channel);
+    const auto eqCurve = calculateLayerCurveLocked (eqLayer, channel);
     auto corrected = makeDefaultGrid();
     const auto correctionActive = isEqLayerAudibleLocked (eqLayer)
                                && parameters.getRawParameterValue ("bypass")->load() < 0.5f;
@@ -1214,10 +1603,12 @@ const FlexCurveLayer* FlexCurveAudioProcessor::findAutoEqDisplayContextLocked (i
     return it == layers.rend() ? nullptr : &(*it);
 }
 
-float FlexCurveAudioProcessor::getReferenceDisplayOffsetLocked (int referenceLayerId) const
+float FlexCurveAudioProcessor::getReferenceDisplayOffsetLocked (
+    int referenceLayerId, FlexChannelSelection channel) const
 {
     if (const auto* context = findAutoEqDisplayContextLocked (referenceLayerId))
-        return context->autoEqReferenceOffsetDb;
+        return channel == FlexChannelSelection::right && ! context->channelsLinked
+            ? context->right.autoEqReferenceOffsetDb : context->autoEqReferenceOffsetDb;
     return 0.0f;
 }
 
@@ -1238,14 +1629,26 @@ void FlexCurveAudioProcessor::markLinkedAutoEqLayersOutdatedLocked (int referenc
     for (auto& layer : layers)
         if (layer.type == FlexCurveLayerType::eq
             && (layer.autoEqRawLayerId == referenceLayerId || layer.autoEqTargetLayerId == referenceLayerId))
+        {
             layer.autoEqSourcesOutdated = true;
+            layer.right.autoEqSourcesOutdated = true;
+        }
 }
 
 std::vector<CurvePoint> FlexCurveAudioProcessor::getCorrectedMeasurementCurve (int eqLayerId) const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = findLayer (eqLayerId))
-        return calculateCorrectedMeasurementLocked (*layer);
+        return calculateCorrectedMeasurementLocked (*layer, getDisplayChannelLocked (*layer));
+    return {};
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::getCorrectedMeasurementCurve (
+    int eqLayerId, FlexChannelSelection channel) const
+{
+    const juce::ScopedLock lock (projectLock);
+    if (const auto* layer = findLayer (eqLayerId))
+        return calculateCorrectedMeasurementLocked (*layer, channel);
     return {};
 }
 
@@ -1259,11 +1662,17 @@ double FlexCurveAudioProcessor::getAutoEqResidualRmsDb (int eqLayerId) const
     if (target == nullptr || target->type != FlexCurveLayerType::target)
         return 0.0;
 
-    const auto corrected = calculateCorrectedMeasurementLocked (*eq);
-    auto targetCurve = calculateLayerCurveLocked (*target);
-    if (eq->autoEqReferenceDisplayEnabled)
+    const auto channel = getDisplayChannelLocked (*eq);
+    const auto corrected = calculateCorrectedMeasurementLocked (*eq, channel);
+    auto targetCurve = calculateLayerCurveLocked (*target, channel);
+    const auto useRight = channel == FlexChannelSelection::right && ! eq->channelsLinked;
+    const auto referenceDisplayEnabled = useRight
+        ? eq->right.autoEqReferenceDisplayEnabled : eq->autoEqReferenceDisplayEnabled;
+    const auto referenceOffset = useRight
+        ? eq->right.autoEqReferenceOffsetDb : eq->autoEqReferenceOffsetDb;
+    if (referenceDisplayEnabled)
         for (auto& point : targetCurve)
-            point.db += eq->autoEqReferenceOffsetDb;
+            point.db += referenceOffset;
     if (corrected.empty() || targetCurve.empty())
         return 0.0;
 
@@ -1288,15 +1697,33 @@ void FlexCurveAudioProcessor::setRegionSettings (float bassDb, float midDb, floa
     {
         const juce::ScopedLock lock (projectLock);
         auto* active = getActiveLayer();
-        auto& target = blendPerLayerMode && active != nullptr ? active->blend : globalBlend;
-        const auto range = globalDbRange.load();
-        target.bassGainDb = juce::jlimit (-range, range, bassDb);
-        target.midGainDb = juce::jlimit (-range, range, midDb);
-        target.trebleGainDb = juce::jlimit (-range, range, trebleDb);
-        target.lowMidCrossoverHz = juce::jlimit (60.0f, 1200.0f, lowMidHz);
-        target.midHighCrossoverHz = juce::jlimit (1200.0f, 12000.0f, midHighHz);
-        if (target.midHighCrossoverHz <= target.lowMidCrossoverHz * 1.5f)
-            target.midHighCrossoverHz = target.lowMidCrossoverHz * 1.5f;
+        if (blendPerLayerMode && active != nullptr)
+        {
+            const auto range = globalDbRange.load();
+            applyToSelectedChannelsLocked (*active, [=] (auto& channel)
+            {
+                channel.blend.bassGainDb = juce::jlimit (-range, range, bassDb);
+                channel.blend.midGainDb = juce::jlimit (-range, range, midDb);
+                channel.blend.trebleGainDb = juce::jlimit (-range, range, trebleDb);
+                channel.blend.lowMidCrossoverHz = juce::jlimit (60.0f, 1200.0f, lowMidHz);
+                channel.blend.midHighCrossoverHz = juce::jlimit (1200.0f, 12000.0f, midHighHz);
+                if (channel.blend.midHighCrossoverHz <= channel.blend.lowMidCrossoverHz * 1.5f)
+                    channel.blend.midHighCrossoverHz = channel.blend.lowMidCrossoverHz * 1.5f;
+            });
+            finalCurve = calculateFinalCurveLocked();
+        }
+        else
+        {
+            auto& target = globalBlend;
+            const auto range = globalDbRange.load();
+            target.bassGainDb = juce::jlimit (-range, range, bassDb);
+            target.midGainDb = juce::jlimit (-range, range, midDb);
+            target.trebleGainDb = juce::jlimit (-range, range, trebleDb);
+            target.lowMidCrossoverHz = juce::jlimit (60.0f, 1200.0f, lowMidHz);
+            target.midHighCrossoverHz = juce::jlimit (1200.0f, 12000.0f, midHighHz);
+            if (target.midHighCrossoverHz <= target.lowMidCrossoverHz * 1.5f)
+                target.midHighCrossoverHz = target.lowMidCrossoverHz * 1.5f;
+        }
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1306,12 +1733,25 @@ void FlexCurveAudioProcessor::getRegionSettings (float& bassDb, float& midDb, fl
 {
     const juce::ScopedLock lock (projectLock);
     const auto* active = getActiveLayer();
-    const auto& source = blendPerLayerMode && active != nullptr ? active->blend : globalBlend;
-    bassDb = source.bassGainDb;
-    midDb = source.midGainDb;
-    trebleDb = source.trebleGainDb;
-    lowMidHz = source.lowMidCrossoverHz;
-    midHighHz = source.midHighCrossoverHz;
+    FlexCurveLayer rightView;
+    const FlexBlendSettings* source = &globalBlend;
+    if (blendPerLayerMode && active != nullptr)
+    {
+        if (active->selectedChannel == FlexChannelSelection::right && ! active->channelsLinked)
+        {
+            loadRightChannelIntoLayerView (*active, rightView);
+            source = &rightView.blend;
+        }
+        else
+        {
+            source = &active->blend;
+        }
+    }
+    bassDb = source->bassGainDb;
+    midDb = source->midGainDb;
+    trebleDb = source->trebleGainDb;
+    lowMidHz = source->lowMidCrossoverHz;
+    midHighHz = source->midHighCrossoverHz;
 }
 
 void FlexCurveAudioProcessor::setBlendPerLayerMode (bool perLayer)
@@ -1346,16 +1786,20 @@ void FlexCurveAudioProcessor::resetActiveLayerBlendToFlat()
         {
             if (auto* layer = getActiveLayer())
             {
-                layer->points = makeDefaultGrid();
-                layer->gainDb = 0.0f;
-                layer->blend = {};
-                layer->graphic15Gains.fill (0.0f);
-                layer->graphic31Gains.fill (0.0f);
-                layer->freeformPoints.clear();
-                layer->paramBands.assign (8, {});
-                layer->graphicEnabled = false;
-                layer->preserveVariableShapeAcrossModes = false;
-                layer->smoothGraphicCurve = false;
+                layer->balanceDb = 0.0f;
+                applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+                {
+                    channel.points = makeDefaultGrid();
+                    channel.gainDb = 0.0f;
+                    channel.blend = {};
+                    channel.graphic15Gains.fill (0.0f);
+                    channel.graphic31Gains.fill (0.0f);
+                    channel.freeformPoints.clear();
+                    channel.paramBands.assign (8, {});
+                    channel.graphicEnabled = false;
+                    channel.preserveVariableShapeAcrossModes = false;
+                    channel.smoothGraphicCurve = false;
+                });
             }
         }
         else
@@ -1378,7 +1822,10 @@ void FlexCurveAudioProcessor::setGraphicMode (int mode)
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->graphicMode = (mode == 0 ? 0 : (mode == 15 ? 15 : 31));
+            applyToSelectedChannelsLocked (*layer, [mode] (auto& channel)
+            {
+                channel.graphicMode = (mode == 0 ? 0 : (mode == 15 ? 15 : 31));
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1393,7 +1840,10 @@ void FlexCurveAudioProcessor::setGraphicEnabled (bool enabled)
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->graphicEnabled = enabled;
+            applyToSelectedChannelsLocked (*layer, [enabled] (auto& channel)
+            {
+                channel.graphicEnabled = enabled;
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1408,7 +1858,10 @@ void FlexCurveAudioProcessor::setPreserveVariableShapeAcrossModes (bool preserve
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->preserveVariableShapeAcrossModes = preserve;
+            applyToSelectedChannelsLocked (*layer, [preserve] (auto& channel)
+            {
+                channel.preserveVariableShapeAcrossModes = preserve;
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1418,7 +1871,11 @@ bool FlexCurveAudioProcessor::isPreserveVariableShapeAcrossModes() const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
+    {
+        if (layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked)
+            return layer->right.preserveVariableShapeAcrossModes;
         return layer->preserveVariableShapeAcrossModes;
+    }
     return false;
 }
 
@@ -1431,7 +1888,10 @@ void FlexCurveAudioProcessor::setGraphicSmoothing (bool enabled)
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->smoothGraphicCurve = enabled;
+            applyToSelectedChannelsLocked (*layer, [enabled] (auto& channel)
+            {
+                channel.smoothGraphicCurve = enabled;
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1441,7 +1901,8 @@ bool FlexCurveAudioProcessor::isGraphicSmoothingEnabled() const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
-        return layer->smoothGraphicCurve;
+        return layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+            ? layer->right.smoothGraphicCurve : layer->smoothGraphicCurve;
     return false;
 }
 
@@ -1455,8 +1916,14 @@ void FlexCurveAudioProcessor::setAllGraphicSmoothing (bool enabled)
         const juce::ScopedLock lock (projectLock);
         for (auto& layer : layers)
         {
-            layer.smoothGraphicCurve = enabled;
-            layer.smoothSourceCurve = enabled;
+            const auto selection = layer.selectedChannel;
+            layer.selectedChannel = FlexChannelSelection::stereo;
+            applyToSelectedChannelsLocked (layer, [enabled] (auto& channel)
+            {
+                channel.smoothGraphicCurve = enabled;
+                channel.smoothSourceCurve = enabled;
+            });
+            layer.selectedChannel = selection;
         }
         for (const auto& layer : layers)
             if (layer.type != FlexCurveLayerType::eq)
@@ -1471,7 +1938,9 @@ bool FlexCurveAudioProcessor::areAllGraphicCurvesSmoothed() const
     const juce::ScopedLock lock (projectLock);
     return ! layers.empty() && std::all_of (layers.begin(), layers.end(), [] (const auto& layer)
     {
-        return layer.smoothGraphicCurve && layer.smoothSourceCurve;
+        return layer.smoothGraphicCurve && layer.smoothSourceCurve
+            && (layer.channelsLinked
+                || (layer.right.smoothGraphicCurve && layer.right.smoothSourceCurve));
     });
 }
 
@@ -1481,7 +1950,8 @@ int FlexCurveAudioProcessor::getGraphicMode() const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
-        return layer->graphicMode;
+        return layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+            ? layer->right.graphicMode : layer->graphicMode;
     return 31;
 }
 
@@ -1489,7 +1959,8 @@ bool FlexCurveAudioProcessor::isGraphicEnabled() const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
-        return layer->graphicEnabled;
+        return layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+            ? layer->right.graphicEnabled : layer->graphicEnabled;
     return false;
 }
 
@@ -1507,10 +1978,14 @@ float FlexCurveAudioProcessor::getGraphicGain (int index) const
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
     {
-        if (layer->graphicMode == 15)
-            return layer->graphic15Gains[static_cast<size_t> (juce::jlimit (0, 14, index))];
-        if (layer->graphicMode == 31)
-            return layer->graphic31Gains[static_cast<size_t> (juce::jlimit (0, 30, index))];
+        const auto right = layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked;
+        const auto mode = right ? layer->right.graphicMode : layer->graphicMode;
+        if (mode == 15)
+            return right ? layer->right.graphic15Gains[static_cast<size_t> (juce::jlimit (0, 14, index))]
+                         : layer->graphic15Gains[static_cast<size_t> (juce::jlimit (0, 14, index))];
+        if (mode == 31)
+            return right ? layer->right.graphic31Gains[static_cast<size_t> (juce::jlimit (0, 30, index))]
+                         : layer->graphic31Gains[static_cast<size_t> (juce::jlimit (0, 30, index))];
     }
     return 0.0f;
 }
@@ -1526,10 +2001,13 @@ void FlexCurveAudioProcessor::setGraphicGain (int index, float gainDb)
         if (auto* layer = getActiveLayer())
         {
             const auto limited = juce::jlimit (-globalDbRange.load(), globalDbRange.load(), gainDb);
-            if (layer->graphicMode == 15)
-                layer->graphic15Gains[static_cast<size_t> (juce::jlimit (0, 14, index))] = limited;
-            else if (layer->graphicMode == 31)
-                layer->graphic31Gains[static_cast<size_t> (juce::jlimit (0, 30, index))] = limited;
+            applyToSelectedChannelsLocked (*layer, [=] (auto& channel)
+            {
+                if (channel.graphicMode == 15)
+                    channel.graphic15Gains[static_cast<size_t> (juce::jlimit (0, 14, index))] = limited;
+                else if (channel.graphicMode == 31)
+                    channel.graphic31Gains[static_cast<size_t> (juce::jlimit (0, 30, index))] = limited;
+            });
         }
         finalCurve = calculateFinalCurveLocked();
     }
@@ -1546,12 +2024,15 @@ void FlexCurveAudioProcessor::resetGraphic()
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
         {
-            if (layer->graphicMode == 15)
-                layer->graphic15Gains.fill (0.0f);
-            else if (layer->graphicMode == 31)
-                layer->graphic31Gains.fill (0.0f);
-            else
-                layer->freeformPoints.clear();
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                if (channel.graphicMode == 15)
+                    channel.graphic15Gains.fill (0.0f);
+                else if (channel.graphicMode == 31)
+                    channel.graphic31Gains.fill (0.0f);
+                else
+                    channel.freeformPoints.clear();
+            });
         }
         finalCurve = calculateFinalCurveLocked();
     }
@@ -1562,7 +2043,8 @@ std::vector<FlexParamBand> FlexCurveAudioProcessor::getParamBands() const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
-        return layer->paramBands;
+        return layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+            ? layer->right.paramBands : layer->paramBands;
     return std::vector<FlexParamBand> (8);
 }
 
@@ -1576,10 +2058,14 @@ void FlexCurveAudioProcessor::addParamBand()
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
         {
-            FlexParamBand band;
-            const auto index = static_cast<int> (layer->paramBands.size());
-            band.frequency = static_cast<float> (juce::jlimit (20.0, 20000.0, 80.0 * std::pow (1.55, index)));
-            layer->paramBands.push_back (band);
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                FlexParamBand band;
+                const auto index = static_cast<int> (channel.paramBands.size());
+                band.frequency = static_cast<float> (
+                    juce::jlimit (20.0, 20000.0, 80.0 * std::pow (1.55, index)));
+                channel.paramBands.push_back (band);
+            });
             finalCurve = calculateFinalCurveLocked();
         }
     }
@@ -1599,8 +2085,11 @@ void FlexCurveAudioProcessor::removeParamBand (int index)
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
         {
-            if (index < static_cast<int> (layer->paramBands.size()))
-                layer->paramBands.erase (layer->paramBands.begin() + index);
+            applyToSelectedChannelsLocked (*layer, [index] (auto& channel)
+            {
+                if (index < static_cast<int> (channel.paramBands.size()))
+                    channel.paramBands.erase (channel.paramBands.begin() + index);
+            });
             finalCurve = calculateFinalCurveLocked();
         }
     }
@@ -1619,13 +2108,16 @@ void FlexCurveAudioProcessor::setParamBand (int index, const FlexParamBand& band
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
         {
-            if (index >= static_cast<int> (layer->paramBands.size()))
-                layer->paramBands.resize (static_cast<size_t> (index + 1));
             auto safeBand = band;
             safeBand.frequency = juce::jlimit (20.0f, 20000.0f, safeBand.frequency);
             safeBand.gainDb = juce::jlimit (-globalDbRange.load(), globalDbRange.load(), safeBand.gainDb);
             safeBand.q = juce::jlimit (0.05f, 33.3333f, safeBand.q);
-            layer->paramBands[static_cast<size_t> (index)] = safeBand;
+            applyToSelectedChannelsLocked (*layer, [=] (auto& channel)
+            {
+                if (index >= static_cast<int> (channel.paramBands.size()))
+                    channel.paramBands.resize (static_cast<size_t> (index + 1));
+                channel.paramBands[static_cast<size_t> (index)] = safeBand;
+            });
             finalCurve = calculateFinalCurveLocked();
         }
     }
@@ -1641,7 +2133,10 @@ void FlexCurveAudioProcessor::resetParametric()
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->paramBands.assign (8, {});
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                channel.paramBands.assign (8, {});
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1651,7 +2146,8 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getFreeformPoints() const
 {
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
-        return layer->freeformPoints;
+        return layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+            ? layer->right.freeformPoints : layer->freeformPoints;
     return {};
 }
 
@@ -1671,7 +2167,10 @@ void FlexCurveAudioProcessor::setFreeformPoints (std::vector<CurvePoint> points)
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->freeformPoints = std::move (points);
+            applyToSelectedChannelsLocked (*layer, [&points] (auto& channel)
+            {
+                channel.freeformPoints = points;
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1686,7 +2185,10 @@ void FlexCurveAudioProcessor::resetFreeform()
     {
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
-            layer->freeformPoints.clear();
+            applyToSelectedChannelsLocked (*layer, [] (auto& channel)
+            {
+                channel.freeformPoints.clear();
+            });
         finalCurve = calculateFinalCurveLocked();
     }
     markPreviewDirty();
@@ -1697,16 +2199,21 @@ void FlexCurveAudioProcessor::copyCurrentGraphicEq()
     const juce::ScopedLock lock (projectLock);
     if (const auto* layer = getActiveLayer())
     {
-        copiedEqKind = layer->graphicMode == 15 ? EqClipboardKind::graphic15
-                     : layer->graphicMode == 31 ? EqClipboardKind::graphic31
+        auto view = *layer;
+        if (layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked)
+            loadRightChannelIntoLayerView (*layer, view);
+        copiedEqSourceLayerId = layer->id;
+        copiedEqSourceChannel = layer->selectedChannel;
+        copiedEqKind = view.graphicMode == 15 ? EqClipboardKind::graphic15
+                     : view.graphicMode == 31 ? EqClipboardKind::graphic31
                                                 : EqClipboardKind::variable;
-        copiedSmoothGraphicCurve = layer->smoothGraphicCurve;
+        copiedSmoothGraphicCurve = view.smoothGraphicCurve;
         if (copiedEqKind == EqClipboardKind::graphic15)
-            copiedGraphic15Gains = layer->graphic15Gains;
+            copiedGraphic15Gains = view.graphic15Gains;
         else if (copiedEqKind == EqClipboardKind::graphic31)
-            copiedGraphic31Gains = layer->graphic31Gains;
+            copiedGraphic31Gains = view.graphic31Gains;
         else
-            copiedFreeformPoints = layer->freeformPoints;
+            copiedFreeformPoints = view.freeformPoints;
     }
 }
 
@@ -1716,12 +2223,17 @@ bool FlexCurveAudioProcessor::canPasteCurrentGraphicEq() const
     const auto* layer = getActiveLayer();
     if (layer == nullptr)
         return false;
+    if (copiedEqSourceLayerId == layer->id
+        && copiedEqSourceChannel == layer->selectedChannel)
+        return false;
 
-    if (layer->graphicMode == 0)
+    const auto mode = layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+        ? layer->right.graphicMode : layer->graphicMode;
+    if (mode == 0)
         return copiedEqKind == EqClipboardKind::graphic15
             || copiedEqKind == EqClipboardKind::graphic31
             || copiedEqKind == EqClipboardKind::variable;
-    if (layer->graphicMode == 31)
+    if (mode == 31)
         return copiedEqKind == EqClipboardKind::graphic15
             || copiedEqKind == EqClipboardKind::graphic31;
     return copiedEqKind == EqClipboardKind::graphic15;
@@ -1741,58 +2253,61 @@ void FlexCurveAudioProcessor::pasteCurrentGraphicEq (bool inverted)
         if (auto* layer = getActiveLayer())
         {
             const auto sign = inverted ? -1.0f : 1.0f;
-            layer->graphicEnabled = true;
-            layer->smoothGraphicCurve = copiedSmoothGraphicCurve;
-            if (layer->graphicMode == 15)
+            applyToSelectedChannelsLocked (*layer, [this, sign] (auto& channel)
             {
-                for (size_t i = 0; i < layer->graphic15Gains.size(); ++i)
-                    layer->graphic15Gains[i] = sign * copiedGraphic15Gains[i];
-            }
-            else if (layer->graphicMode == 31)
-            {
-                if (copiedEqKind == EqClipboardKind::graphic31)
+                channel.graphicEnabled = true;
+                channel.smoothGraphicCurve = copiedSmoothGraphicCurve;
+                if (channel.graphicMode == 15)
                 {
-                    for (size_t i = 0; i < layer->graphic31Gains.size(); ++i)
-                        layer->graphic31Gains[i] = sign * copiedGraphic31Gains[i];
+                    for (size_t i = 0; i < channel.graphic15Gains.size(); ++i)
+                        channel.graphic15Gains[i] = sign * copiedGraphic15Gains[i];
                 }
-                else
+                else if (channel.graphicMode == 31)
                 {
-                    std::vector<CurvePoint> source;
-                    source.reserve (copiedGraphic15Gains.size());
-                    const auto frequencies = graphic15Frequencies();
-                    for (size_t i = 0; i < copiedGraphic15Gains.size(); ++i)
-                        source.push_back ({ frequencies[i], sign * copiedGraphic15Gains[i] });
-                    const auto destinationFrequencies = graphic31Frequencies();
-                    for (size_t i = 0; i < layer->graphic31Gains.size(); ++i)
-                        layer->graphic31Gains[i] = static_cast<float> (
-                            CurveFIR::interpolateDb (source, destinationFrequencies[i]));
-                }
-            }
-            else
-            {
-                layer->freeformPoints.clear();
-                if (copiedEqKind == EqClipboardKind::variable)
-                {
-                    layer->freeformPoints = copiedFreeformPoints;
-                    for (auto& point : layer->freeformPoints)
-                        point.db *= sign;
-                }
-                else
-                {
-                    const auto count = copiedEqKind == EqClipboardKind::graphic31 ? 31 : 15;
-                    layer->freeformPoints.reserve (static_cast<size_t> (count));
-                    for (int i = 0; i < count; ++i)
+                    if (copiedEqKind == EqClipboardKind::graphic31)
                     {
-                        const auto frequency = copiedEqKind == EqClipboardKind::graphic31
-                            ? graphic31Frequencies()[static_cast<size_t> (i)]
-                            : graphic15Frequencies()[static_cast<size_t> (i)];
-                        const auto gain = copiedEqKind == EqClipboardKind::graphic31
-                            ? copiedGraphic31Gains[static_cast<size_t> (i)]
-                            : copiedGraphic15Gains[static_cast<size_t> (i)];
-                        layer->freeformPoints.push_back ({ frequency, sign * gain });
+                        for (size_t i = 0; i < channel.graphic31Gains.size(); ++i)
+                            channel.graphic31Gains[i] = sign * copiedGraphic31Gains[i];
+                    }
+                    else
+                    {
+                        std::vector<CurvePoint> source;
+                        source.reserve (copiedGraphic15Gains.size());
+                        const auto frequencies = graphic15Frequencies();
+                        for (size_t i = 0; i < copiedGraphic15Gains.size(); ++i)
+                            source.push_back ({ frequencies[i], sign * copiedGraphic15Gains[i] });
+                        const auto destinationFrequencies = graphic31Frequencies();
+                        for (size_t i = 0; i < channel.graphic31Gains.size(); ++i)
+                            channel.graphic31Gains[i] = static_cast<float> (
+                                CurveFIR::interpolateDb (source, destinationFrequencies[i]));
                     }
                 }
-            }
+                else
+                {
+                    channel.freeformPoints.clear();
+                    if (copiedEqKind == EqClipboardKind::variable)
+                    {
+                        channel.freeformPoints = copiedFreeformPoints;
+                        for (auto& point : channel.freeformPoints)
+                            point.db *= sign;
+                    }
+                    else
+                    {
+                        const auto count = copiedEqKind == EqClipboardKind::graphic31 ? 31 : 15;
+                        channel.freeformPoints.reserve (static_cast<size_t> (count));
+                        for (int i = 0; i < count; ++i)
+                        {
+                            const auto frequency = copiedEqKind == EqClipboardKind::graphic31
+                                ? graphic31Frequencies()[static_cast<size_t> (i)]
+                                : graphic15Frequencies()[static_cast<size_t> (i)];
+                            const auto gain = copiedEqKind == EqClipboardKind::graphic31
+                                ? copiedGraphic31Gains[static_cast<size_t> (i)]
+                                : copiedGraphic15Gains[static_cast<size_t> (i)];
+                            channel.freeformPoints.push_back ({ frequency, sign * gain });
+                        }
+                    }
+                }
+            });
 
             finalCurve = calculateFinalCurveLocked();
         }
@@ -1806,14 +2321,20 @@ void FlexCurveAudioProcessor::copyCurrentParametricEq()
     if (const auto* layer = getActiveLayer())
     {
         copiedEqKind = EqClipboardKind::parametric;
-        copiedParamBands = layer->paramBands;
+        copiedEqSourceLayerId = layer->id;
+        copiedEqSourceChannel = layer->selectedChannel;
+        copiedParamBands = layer->selectedChannel == FlexChannelSelection::right && ! layer->channelsLinked
+            ? layer->right.paramBands : layer->paramBands;
     }
 }
 
 bool FlexCurveAudioProcessor::canPasteCurrentParametricEq() const
 {
     const juce::ScopedLock lock (projectLock);
-    return copiedEqKind == EqClipboardKind::parametric && getActiveLayer() != nullptr;
+    const auto* layer = getActiveLayer();
+    return copiedEqKind == EqClipboardKind::parametric && layer != nullptr
+        && (copiedEqSourceLayerId != layer->id
+            || copiedEqSourceChannel != layer->selectedChannel);
 }
 
 void FlexCurveAudioProcessor::pasteCurrentParametricEq (bool inverted)
@@ -1826,12 +2347,15 @@ void FlexCurveAudioProcessor::pasteCurrentParametricEq (bool inverted)
         const juce::ScopedLock lock (projectLock);
         if (auto* layer = getActiveLayer())
         {
-            layer->paramBands = copiedParamBands;
-            if (layer->paramBands.empty())
-                layer->paramBands.resize (8);
-            if (inverted)
-                for (auto& band : layer->paramBands)
-                    band.gainDb = -band.gainDb;
+            applyToSelectedChannelsLocked (*layer, [this, inverted] (auto& channel)
+            {
+                channel.paramBands = copiedParamBands;
+                if (channel.paramBands.empty())
+                    channel.paramBands.resize (8);
+                if (inverted)
+                    for (auto& band : channel.paramBands)
+                        band.gainDb = -band.gainDb;
+            });
             finalCurve = calculateFinalCurveLocked();
         }
     }
@@ -1840,6 +2364,11 @@ void FlexCurveAudioProcessor::pasteCurrentParametricEq (bool inverted)
 
 void FlexCurveAudioProcessor::markPreviewDirty()
 {
+    {
+        const juce::ScopedLock lock (projectLock);
+        finalCurve = calculateAverageCurveLocked (FlexChannelSelection::left);
+        finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
+    }
     previewFiltersDirty = true;
     if (restoringState.load())
         return;
@@ -1854,8 +2383,25 @@ void FlexCurveAudioProcessor::markPreviewDirty()
     }
 }
 
-std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveLocked (const FlexCurveLayer& layer) const
+std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveLocked (
+    const FlexCurveLayer& layer) const
 {
+    return calculateLayerCurveLocked (layer, getDisplayChannelLocked (layer));
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveLocked (
+    const FlexCurveLayer& layer, FlexChannelSelection channel) const
+{
+    if (channel == FlexChannelSelection::right && ! layer.channelsLinked)
+    {
+        auto rightView = layer;
+        loadRightChannelIntoLayerView (layer, rightView);
+        rightView.channelsLinked = true;
+        rightView.selectedChannel = FlexChannelSelection::left;
+        rightView.balanceDb = -layer.balanceDb;
+        return calculateLayerCurveLocked (rightView, FlexChannelSelection::left);
+    }
+
     auto points = makeDefaultGrid();
     auto graphicContribution = makeDefaultGrid();
 
@@ -1867,6 +2413,13 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveLocked (cons
 
     for (auto& point : points)
         point.db += layer.gainDb + layer.normalizationOffsetDb;
+
+    if (layer.type == FlexCurveLayerType::eq)
+    {
+        const auto balanceOffset = channelBalanceOffsetDb (layer.balanceDb, channel);
+        for (auto& point : points)
+            point.db += balanceOffset;
+    }
 
     if (layer.graphicEnabled)
     {
@@ -1931,20 +2484,55 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveLocked (cons
     return points;
 }
 
-std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveWithoutFreeformLocked (const FlexCurveLayer& layer) const
+std::vector<CurvePoint> FlexCurveAudioProcessor::calculateLayerCurveWithoutFreeformLocked (
+    const FlexCurveLayer& layer, FlexChannelSelection channel) const
 {
     auto copy = layer;
-    copy.freeformPoints.clear();
-    return calculateLayerCurveLocked (copy);
+    if (channel == FlexChannelSelection::right && ! copy.channelsLinked)
+        copy.right.freeformPoints.clear();
+    else
+        copy.freeformPoints.clear();
+    return calculateLayerCurveLocked (copy, channel);
 }
 
-std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveLocked() const
+std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveLocked (
+    FlexChannelSelection channel) const
 {
-    return calculateAverageCurveForTypeLocked (FlexCurveLayerType::eq);
+    const auto anySolo = std::any_of (layers.begin(), layers.end(), [] (const auto& layer)
+    {
+        return layer.type == FlexCurveLayerType::eq && layer.solo;
+    });
+    std::vector<const FlexCurveLayer*> sourceLayers;
+    for (const auto& layer : layers)
+        if (layer.type == FlexCurveLayerType::eq && ! layer.muted && layer.enabled
+            && layer.opacity > 0.0f && (! anySolo || layer.solo))
+            sourceLayers.push_back (&layer);
+
+    if (sourceLayers.empty())
+        return {};
+
+    std::vector<std::vector<CurvePoint>> sourceCurves;
+    sourceCurves.reserve (sourceLayers.size());
+    for (const auto* layer : sourceLayers)
+        sourceCurves.push_back (calculateLayerCurveLocked (*layer, channel));
+
+    auto points = makeDefaultGrid();
+    for (auto& point : points)
+    {
+        double sum = 0.0;
+        double weightSum = 0.0;
+        for (size_t i = 0; i < sourceLayers.size(); ++i)
+        {
+            sum += CurveFIR::interpolateDb (sourceCurves[i], point.frequency) * sourceLayers[i]->opacity;
+            weightSum += sourceLayers[i]->opacity;
+        }
+        point.db = weightSum > 0.0 ? sum / weightSum : 0.0;
+    }
+    return points;
 }
 
 std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveForTypeLocked (
-    FlexCurveLayerType type, bool applyReferenceDisplayOffset) const
+    FlexCurveLayerType type, bool applyReferenceDisplayOffset, FlexChannelSelection channel) const
 {
     const auto anySolo = type == FlexCurveLayerType::eq
         && std::any_of (layers.begin(), layers.end(), [] (const auto& layer)
@@ -1964,11 +2552,11 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveForTypeLoc
     sourceCurves.reserve (sourceLayers.size());
     for (const auto* layer : sourceLayers)
     {
-        auto curve = calculateLayerCurveLocked (*layer);
+        auto curve = calculateLayerCurveLocked (*layer, channel);
         if (applyReferenceDisplayOffset
             && (type == FlexCurveLayerType::raw || type == FlexCurveLayerType::target))
         {
-            const auto displayOffset = getReferenceDisplayOffsetLocked (layer->id);
+            const auto displayOffset = getReferenceDisplayOffsetLocked (layer->id, channel);
             for (auto& point : curve)
                 point.db += displayOffset;
         }
@@ -1993,13 +2581,14 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveForTypeLoc
 
 std::vector<CurvePoint> FlexCurveAudioProcessor::calculateFinalCurveLocked() const
 {
-    return calculateAverageCurveLocked();
+    return calculateAverageCurveLocked (FlexChannelSelection::left);
 }
 
 void FlexCurveAudioProcessor::updateFinalCurve()
 {
     const juce::ScopedLock lock (projectLock);
     finalCurve = calculateFinalCurveLocked();
+    finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
 }
 
 void FlexCurveAudioProcessor::renderFir()
@@ -2011,10 +2600,13 @@ void FlexCurveAudioProcessor::renderFir()
     updateFinalCurve();
 
     std::vector<CurvePoint> points;
+    std::vector<CurvePoint> rightPoints;
     {
         const juce::ScopedLock lock (projectLock);
-        points = finalCurve;
-        renderedCurve = finalCurve;
+        points = calculateAverageCurveLocked (FlexChannelSelection::left);
+        rightPoints = calculateAverageCurveLocked (FlexChannelSelection::right);
+        renderedCurve = points;
+        renderedCurveRight = rightPoints;
     }
 
     if (points.empty())
@@ -2022,18 +2614,28 @@ void FlexCurveAudioProcessor::renderFir()
 
     const auto phaseMode = getPhaseMode();
     const auto taps = getDefaultFirTapsForMode (phaseMode);
-    auto impulse = createImpulseForPhaseMode (points, currentSampleRate, taps);
+    auto impulse = createStereoImpulseForPhaseMode (points, rightPoints, currentSampleRate, taps);
 
     activeImpulsePeakSamples = findImpulseResponsePeak (impulse);
     applyActiveLatency (getLatencyForPhaseMode (phaseMode, impulse.getNumSamples()));
     convolution.loadImpulseResponse (std::move (impulse),
                                      currentSampleRate,
-                                     juce::dsp::Convolution::Stereo::no,
+                                     impulse.getNumChannels() > 1 ? juce::dsp::Convolution::Stereo::yes
+                                                                  : juce::dsp::Convolution::Stereo::no,
                                      juce::dsp::Convolution::Trim::no,
                                      juce::dsp::Convolution::Normalise::no);
 
     {
         const juce::ScopedLock lock (projectLock);
+        const auto renderedChannelsDiffer = [&]
+        {
+            if (points.size() != rightPoints.size())
+                return true;
+            for (size_t i = 0; i < points.size(); ++i)
+                if (std::abs (points[i].db - rightPoints[i].db) > 1.0e-4)
+                    return true;
+            return false;
+        }();
         FlexCurveLayer renderedLayer;
         renderedLayer.id = nextLayerId++;
         renderedLayer.name = "Rendered FIR";
@@ -2046,6 +2648,9 @@ void FlexCurveAudioProcessor::renderFir()
         renderedLayer.gainDb = 0.0f;
         renderedLayer.opacity = 1.0f;
         renderedLayer.paramBands.resize (8);
+        copyLeftChannelToRight (renderedLayer);
+        renderedLayer.right.points = rightPoints;
+        renderedLayer.channelsLinked = ! renderedChannelsDiffer;
 
         layers.clear();
         layers.push_back (std::move (renderedLayer));
@@ -2055,7 +2660,9 @@ void FlexCurveAudioProcessor::renderFir()
         globalBlend = {};
         blendPerLayerMode = true;
         finalCurve = points;
+        finalCurveRight = rightPoints;
         renderedCurve = points;
+        renderedCurveRight = rightPoints;
     }
 
     hasRenderedFir = true;
@@ -2069,9 +2676,11 @@ bool FlexCurveAudioProcessor::exportCurrentFirToFile (const juce::File& file)
         return false;
 
     std::vector<CurvePoint> points;
+    std::vector<CurvePoint> rightPoints;
     {
         const juce::ScopedLock lock (projectLock);
         points = renderedCurve;
+        rightPoints = renderedCurveRight.empty() ? renderedCurve : renderedCurveRight;
     }
 
     if (points.empty())
@@ -2083,11 +2692,15 @@ bool FlexCurveAudioProcessor::exportCurrentFirToFile (const juce::File& file)
     if (parameters.getRawParameterValue ("includeautogainfir")->load() > 0.5f)
         exportedGainDb += smoothedRuntimeAutoGainDb.load();
     if (! juce::approximatelyEqual (exportedGainDb, 0.0))
+    {
         for (auto& point : points)
             point.db += exportedGainDb;
+        for (auto& point : rightPoints)
+            point.db += exportedGainDb;
+    }
 
     const auto taps = getDefaultFirTapsForMode (getPhaseMode());
-    auto impulse = createImpulseForPhaseMode (points, currentSampleRate, taps);
+    auto impulse = createStereoImpulseForPhaseMode (points, rightPoints, currentSampleRate, taps);
 
     juce::WavAudioFormat wavFormat;
     if (file.existsAsFile() && ! file.deleteFile())
@@ -2099,7 +2712,9 @@ bool FlexCurveAudioProcessor::exportCurrentFirToFile (const juce::File& file)
 
     const auto metadata = makeFlexCurveFirMetadata (exportedGainDb);
     std::unique_ptr<juce::AudioFormatWriter> writer (
-        wavFormat.createWriterFor (stream.get(), currentSampleRate, 1, 32, metadata, 0));
+        wavFormat.createWriterFor (stream.get(), currentSampleRate,
+                                   static_cast<unsigned int> (impulse.getNumChannels()),
+                                   32, metadata, 0));
     if (writer == nullptr)
         return false;
 
@@ -2187,10 +2802,41 @@ bool FlexCurveAudioProcessor::normalizeReferencesAtFrequency (int rawLayerId, in
             || target->type != FlexCurveLayerType::target)
             return false;
 
-        const auto rawCurve = calculateLayerCurveLocked (*raw);
-        const auto targetCurve = calculateLayerCurveLocked (*target);
-        raw->normalizationOffsetDb -= static_cast<float> (CurveFIR::interpolateDb (rawCurve, frequencyHz));
-        target->normalizationOffsetDb -= static_cast<float> (CurveFIR::interpolateDb (targetCurve, frequencyHz));
+        const auto channel = getActiveLayer() != nullptr
+            ? getActiveLayer()->selectedChannel : raw->selectedChannel;
+        const auto rawLeft = calculateLayerCurveLocked (*raw, FlexChannelSelection::left);
+        const auto rawRight = calculateLayerCurveLocked (*raw, FlexChannelSelection::right);
+        const auto targetLeft = calculateLayerCurveLocked (*target, FlexChannelSelection::left);
+        const auto targetRight = calculateLayerCurveLocked (*target, FlexChannelSelection::right);
+        const auto rawLeftOffset = -static_cast<float> (
+            CurveFIR::interpolateDb (rawLeft, frequencyHz));
+        const auto rawRightOffset = -static_cast<float> (
+            CurveFIR::interpolateDb (rawRight, frequencyHz));
+        const auto targetLeftOffset = -static_cast<float> (
+            CurveFIR::interpolateDb (targetLeft, frequencyHz));
+        const auto targetRightOffset = -static_cast<float> (
+            CurveFIR::interpolateDb (targetRight, frequencyHz));
+
+        auto applyOffsets = [] (FlexCurveLayer& layer, FlexChannelSelection selection,
+                                float leftOffset, float rightOffset)
+        {
+            if (selection != FlexChannelSelection::right)
+                layer.normalizationOffsetDb += leftOffset;
+            if (selection != FlexChannelSelection::left)
+            {
+                if (layer.channelsLinked)
+                {
+                    FlexCurveAudioProcessor::copyLeftChannelToRight (layer);
+                    if (selection == FlexChannelSelection::right)
+                        layer.channelsLinked = false;
+                }
+                layer.right.normalizationOffsetDb += rightOffset;
+            }
+            if (selection == FlexChannelSelection::stereo && layer.channelsLinked)
+                FlexCurveAudioProcessor::copyLeftChannelToRight (layer);
+        };
+        applyOffsets (*raw, channel, rawLeftOffset, rawRightOffset);
+        applyOffsets (*target, channel, targetLeftOffset, targetRightOffset);
         markLinkedAutoEqLayersOutdatedLocked (raw->id);
         markLinkedAutoEqLayersOutdatedLocked (target->id);
         finalCurve = calculateFinalCurveLocked();
@@ -2212,16 +2858,29 @@ void FlexCurveAudioProcessor::normalizeEqLayersToZeroDb()
             if (layer.type != FlexCurveLayerType::eq)
                 continue;
 
-            const auto curve = calculateLayerCurveLocked (layer);
-            if (curve.empty())
-                continue;
-
-            const auto peak = std::max_element (curve.begin(), curve.end(),
-                                                [] (const auto& lhs, const auto& rhs)
-                                                {
-                                                    return lhs.db < rhs.db;
-                                                })->db;
-            layer.gainDb += static_cast<float> (layer.inverted ? peak : -peak);
+            const auto leftCurve = calculateLayerCurveLocked (
+                layer, FlexChannelSelection::left);
+            const auto rightCurve = calculateLayerCurveLocked (
+                layer, FlexChannelSelection::right);
+            if (! leftCurve.empty())
+            {
+                const auto peak = std::max_element (
+                    leftCurve.begin(), leftCurve.end(),
+                    [] (const auto& lhs, const auto& rhs) { return lhs.db < rhs.db; })->db;
+                layer.gainDb += static_cast<float> (layer.inverted ? peak : -peak);
+            }
+            if (! layer.channelsLinked && ! rightCurve.empty())
+            {
+                const auto peak = std::max_element (
+                    rightCurve.begin(), rightCurve.end(),
+                    [] (const auto& lhs, const auto& rhs) { return lhs.db < rhs.db; })->db;
+                layer.right.gainDb += static_cast<float> (
+                    layer.right.inverted ? peak : -peak);
+            }
+            else if (layer.channelsLinked)
+            {
+                copyLeftChannelToRight (layer);
+            }
         }
         finalCurve = calculateFinalCurveLocked();
     }
@@ -2233,13 +2892,23 @@ bool FlexCurveAudioProcessor::generateAutoEq (int rawLayerId, int targetLayerId,
     if (editsBlocked() || ! canAddUserLayer())
         return false;
 
-    std::vector<CurvePoint> correction = makeDefaultGrid();
+    struct GeneratedChannel
+    {
+        std::vector<CurvePoint> correction;
+        std::vector<FlexParamBand> parametric;
+        AutoEqMode mode = AutoEqMode::variable;
+        float peakDb = 0.0f;
+    };
+
     juce::String rawName;
     juce::String targetName;
+    FlexChannelSelection requestedChannel = FlexChannelSelection::stereo;
+    const FlexCurveLayer* raw = nullptr;
+    const FlexCurveLayer* target = nullptr;
     {
         const juce::ScopedLock lock (projectLock);
-        const auto* raw = findLayer (rawLayerId);
-        const auto* target = findLayer (targetLayerId);
+        raw = findLayer (rawLayerId);
+        target = findLayer (targetLayerId);
         if (raw == nullptr || target == nullptr
             || raw->type != FlexCurveLayerType::raw
             || target->type != FlexCurveLayerType::target)
@@ -2247,67 +2916,95 @@ bool FlexCurveAudioProcessor::generateAutoEq (int rawLayerId, int targetLayerId,
 
         rawName = raw->name;
         targetName = target->name;
-        const auto rawCurve = calculateLayerCurveLocked (*raw);
-        const auto targetCurve = calculateLayerCurveLocked (*target);
-        for (auto& point : correction)
-            point.db = juce::jlimit (-12.0, 12.0,
-                                     CurveFIR::interpolateDb (targetCurve, point.frequency)
-                                     - CurveFIR::interpolateDb (rawCurve, point.frequency));
+        if (const auto* active = getActiveLayer())
+            requestedChannel = active->selectedChannel;
+        else
+            requestedChannel = raw->selectedChannel;
     }
 
-    smoothCurveGeometry (correction);
-    smoothCurveGeometry (correction);
-    auto parametric = approximateCurveWithParametricFilters (correction);
-
-    auto selectedMode = mode;
-    if (mode == AutoEqMode::automatic)
+    auto generateChannel = [this, rawLayerId, targetLayerId, mode] (
+        FlexChannelSelection channel) -> GeneratedChannel
     {
-        double squaredError = 0.0;
-        for (const auto& point : correction)
+        GeneratedChannel generated;
+        generated.correction = makeDefaultGrid();
         {
-            double approximation = 0.0;
-            for (const auto& band : parametric)
-                approximation += getBiquadMagnitudeDb (makeFilter (currentSampleRate, band),
-                                                       currentSampleRate,
-                                                       point.frequency);
-            const auto error = approximation - point.db;
-            squaredError += error * error;
+            const juce::ScopedLock lock (projectLock);
+            const auto* channelRaw = findLayer (rawLayerId);
+            const auto* channelTarget = findLayer (targetLayerId);
+            if (channelRaw == nullptr || channelTarget == nullptr)
+                return generated;
+            const auto rawCurve = calculateLayerCurveLocked (*channelRaw, channel);
+            const auto targetCurve = calculateLayerCurveLocked (*channelTarget, channel);
+            for (auto& point : generated.correction)
+                point.db = juce::jlimit (
+                    -12.0, 12.0,
+                    CurveFIR::interpolateDb (targetCurve, point.frequency)
+                        - CurveFIR::interpolateDb (rawCurve, point.frequency));
         }
-        const auto rmsError = std::sqrt (squaredError / juce::jmax (size_t (1), correction.size()));
-        selectedMode = rmsError <= 1.0 && parametric.size() <= 16
-            ? AutoEqMode::parametric
-            : AutoEqMode::variable;
-    }
 
-    auto generatedResponse = makeDefaultGrid();
-    if (selectedMode == AutoEqMode::parametric)
-    {
-        for (auto& point : generatedResponse)
-            for (const auto& band : parametric)
-                if (band.enabled)
-                    point.db += getBiquadMagnitudeDb (makeFilter (currentSampleRate, band),
-                                                      currentSampleRate,
-                                                      point.frequency);
-    }
-    else
-    {
-        generatedResponse = correction;
-        smoothCurveGeometry (generatedResponse);
-    }
+        smoothCurveGeometry (generated.correction);
+        smoothCurveGeometry (generated.correction);
+        generated.parametric = approximateCurveWithParametricFilters (generated.correction);
+        generated.mode = mode;
+        if (mode == AutoEqMode::automatic)
+        {
+            double squaredError = 0.0;
+            for (const auto& point : generated.correction)
+            {
+                double approximation = 0.0;
+                for (const auto& band : generated.parametric)
+                    approximation += getBiquadMagnitudeDb (
+                        makeFilter (currentSampleRate, band), currentSampleRate, point.frequency);
+                const auto error = approximation - point.db;
+                squaredError += error * error;
+            }
+            const auto rmsError = std::sqrt (
+                squaredError / juce::jmax (size_t (1), generated.correction.size()));
+            generated.mode = rmsError <= 1.0 && generated.parametric.size() <= 16
+                ? AutoEqMode::parametric : AutoEqMode::variable;
+        }
 
-    const auto generatedPeakDb = static_cast<float> (std::max_element (
-        generatedResponse.begin(), generatedResponse.end(),
-        [] (const auto& lhs, const auto& rhs) { return lhs.db < rhs.db; })->db);
+        auto response = makeDefaultGrid();
+        if (generated.mode == AutoEqMode::parametric)
+        {
+            for (auto& point : response)
+                for (const auto& band : generated.parametric)
+                    if (band.enabled)
+                        point.db += getBiquadMagnitudeDb (
+                            makeFilter (currentSampleRate, band), currentSampleRate, point.frequency);
+        }
+        else
+        {
+            response = generated.correction;
+            smoothCurveGeometry (response);
+        }
+        generated.peakDb = static_cast<float> (std::max_element (
+            response.begin(), response.end(),
+            [] (const auto& lhs, const auto& rhs) { return lhs.db < rhs.db; })->db);
+        return generated;
+    };
+
+    auto left = generateChannel (FlexChannelSelection::left);
+    auto right = generateChannel (FlexChannelSelection::right);
+    const auto independentPreamp =
+        parameters.getRawParameterValue ("independentlrpreamp")->load() > 0.5f;
+    const auto sharedPeak = juce::jmax (left.peakDb, right.peakDb, 0.0f);
+    const auto leftPreamp = independentPreamp ? -juce::jmax (left.peakDb, 0.0f) : -sharedPeak;
+    const auto rightPreamp = independentPreamp ? -juce::jmax (right.peakDb, 0.0f) : -sharedPeak;
+    const auto correctionsEqual = [&]
+    {
+        if (left.correction.size() != right.correction.size())
+            return false;
+        for (size_t i = 0; i < left.correction.size(); ++i)
+            if (std::abs (left.correction[i].db - right.correction[i].db) > 1.0e-5)
+                return false;
+        return true;
+    }();
 
     recordUndoState ("generate-autoeq");
     {
         const juce::ScopedLock lock (projectLock);
-        auto* target = findLayer (targetLayerId);
-        if (target == nullptr || target->type != FlexCurveLayerType::target)
-            return false;
-
-        auto* raw = findLayer (rawLayerId);
-        if (raw == nullptr || raw->type != FlexCurveLayerType::raw)
+        if (findLayer (targetLayerId) == nullptr || findLayer (rawLayerId) == nullptr)
             return false;
 
         FlexCurveLayer layer;
@@ -2320,15 +3017,15 @@ bool FlexCurveAudioProcessor::generateAutoEq (int rawLayerId, int targetLayerId,
         layer.autoEqRawLayerId = rawLayerId;
         layer.autoEqTargetLayerId = targetLayerId;
         layer.autoEqSourcesOutdated = false;
-        layer.autoEqReferenceOffsetDb = -generatedPeakDb;
+        layer.autoEqReferenceOffsetDb = leftPreamp;
         layer.autoEqReferenceDisplayEnabled = true;
-        layer.autoEqMethod = selectedMode == AutoEqMode::parametric ? "Parametric" : "Variable";
-        layer.gainDb = -generatedPeakDb;
+        layer.autoEqMethod = left.mode == AutoEqMode::parametric ? "Parametric" : "Variable";
+        layer.gainDb = leftPreamp;
         layer.paramBands.resize (8);
 
-        if (selectedMode == AutoEqMode::parametric)
+        if (left.mode == AutoEqMode::parametric)
         {
-            layer.paramBands = std::move (parametric);
+            layer.paramBands = std::move (left.parametric);
             if (layer.paramBands.empty())
                 layer.paramBands.resize (8);
         }
@@ -2336,8 +3033,66 @@ bool FlexCurveAudioProcessor::generateAutoEq (int rawLayerId, int targetLayerId,
         {
             layer.graphicEnabled = true;
             layer.graphicMode = 0;
-            layer.freeformPoints = std::move (correction);
+            layer.freeformPoints = std::move (left.correction);
             layer.smoothGraphicCurve = true;
+        }
+
+        copyLeftChannelToRight (layer);
+        layer.right.autoEqMethod = right.mode == AutoEqMode::parametric ? "Parametric" : "Variable";
+        layer.right.autoEqReferenceOffsetDb = rightPreamp;
+        layer.right.gainDb = rightPreamp;
+        layer.right.paramBands.assign (8, {});
+        layer.right.graphicEnabled = false;
+        layer.right.freeformPoints.clear();
+        if (right.mode == AutoEqMode::parametric)
+        {
+            layer.right.paramBands = std::move (right.parametric);
+            if (layer.right.paramBands.empty())
+                layer.right.paramBands.resize (8);
+        }
+        else
+        {
+            layer.right.graphicEnabled = true;
+            layer.right.graphicMode = 0;
+            layer.right.freeformPoints = std::move (right.correction);
+            layer.right.smoothGraphicCurve = true;
+        }
+        layer.selectedChannel = requestedChannel;
+        layer.channelsLinked = requestedChannel == FlexChannelSelection::stereo
+            && ! independentPreamp
+            && layer.autoEqMethod == layer.right.autoEqMethod
+            && std::abs (leftPreamp - rightPreamp) < 1.0e-5f
+            && correctionsEqual;
+        if (requestedChannel == FlexChannelSelection::left)
+        {
+            layer.right = {};
+            layer.right.points = makeDefaultGrid();
+            layer.right.paramBands.resize (8);
+            layer.channelsLinked = false;
+        }
+        else if (requestedChannel == FlexChannelSelection::right)
+        {
+            const auto rightCorrection = layer.right;
+            layer.autoEqMethod = rightCorrection.autoEqMethod;
+            layer.autoEqSourcesOutdated = rightCorrection.autoEqSourcesOutdated;
+            layer.autoEqReferenceOffsetDb = rightCorrection.autoEqReferenceOffsetDb;
+            layer.autoEqReferenceDisplayEnabled = rightCorrection.autoEqReferenceDisplayEnabled;
+            layer.points = makeDefaultGrid();
+            layer.inverted = false;
+            layer.gainDb = 0.0f;
+            layer.normalizationOffsetDb = 0.0f;
+            layer.smoothSourceCurve = false;
+            layer.blend = {};
+            layer.graphicEnabled = false;
+            layer.graphicMode = 31;
+            layer.preserveVariableShapeAcrossModes = false;
+            layer.smoothGraphicCurve = false;
+            layer.graphic15Gains.fill (0.0f);
+            layer.graphic31Gains.fill (0.0f);
+            layer.paramBands.assign (8, {});
+            layer.freeformPoints.clear();
+            layer.right = rightCorrection;
+            layer.channelsLinked = false;
         }
 
         layers.push_back (std::move (layer));
@@ -2351,46 +3106,90 @@ bool FlexCurveAudioProcessor::generateAutoEq (int rawLayerId, int targetLayerId,
 bool FlexCurveAudioProcessor::exportLayerToFile (int layerId, bool average, CurveExportFormat format, const juce::File& file)
 {
     std::vector<CurvePoint> points;
+    std::vector<CurvePoint> rightPoints;
     double separateGainDb = 0.0;
+    double separateRightGainDb = 0.0;
     const auto supportsSeparateGain = format == CurveExportFormat::firWav
                                    || format == CurveExportFormat::graphicEq
                                    || format == CurveExportFormat::apoParametric;
     {
         const juce::ScopedLock lock (projectLock);
         if (average)
-            points = calculateAverageCurveLocked();
+        {
+            points = calculateAverageCurveLocked (FlexChannelSelection::left);
+            rightPoints = calculateAverageCurveLocked (FlexChannelSelection::right);
+        }
         else if (const auto* layer = findLayer (layerId))
         {
             if (supportsSeparateGain)
             {
                 auto baseLayer = *layer;
                 baseLayer.gainDb = 0.0f;
-                points = calculateLayerCurveLocked (baseLayer);
+                points = calculateLayerCurveLocked (baseLayer, FlexChannelSelection::left);
                 separateGainDb = layer->inverted ? -layer->gainDb : layer->gainDb;
+                if (layer->channelsLinked)
+                {
+                    rightPoints = points;
+                    separateRightGainDb = separateGainDb;
+                }
+                else
+                {
+                    auto rightBase = *layer;
+                    loadRightChannelIntoLayerView (*layer, rightBase);
+                    rightBase.gainDb = 0.0f;
+                    points = calculateLayerCurveLocked (baseLayer, FlexChannelSelection::left);
+                    rightPoints = calculateLayerCurveLocked (rightBase, FlexChannelSelection::left);
+                    separateRightGainDb = layer->right.inverted
+                        ? -layer->right.gainDb : layer->right.gainDb;
+                }
             }
             else
             {
-                points = calculateLayerCurveLocked (*layer);
+                points = calculateLayerCurveLocked (*layer, FlexChannelSelection::left);
+                rightPoints = calculateLayerCurveLocked (*layer, FlexChannelSelection::right);
             }
         }
     }
 
     if (points.empty())
         return false;
+    if (rightPoints.empty())
+        rightPoints = points;
+    const auto channelsDiffer = [&]
+    {
+        if (points.size() != rightPoints.size()
+            || std::abs (separateGainDb - separateRightGainDb) > 1.0e-5)
+            return true;
+        for (size_t i = 0; i < points.size(); ++i)
+            if (std::abs (points[i].db - rightPoints[i].db) > 1.0e-5)
+                return true;
+        return false;
+    }();
 
     if (format == CurveExportFormat::firWav)
     {
         if (parameters.getRawParameterValue ("includeoutputgainfir")->load() > 0.5f)
+        {
             separateGainDb += parameters.getRawParameterValue ("outputgain")->load();
+            separateRightGainDb += parameters.getRawParameterValue ("outputgain")->load();
+        }
         if (parameters.getRawParameterValue ("includeautogainfir")->load() > 0.5f)
+        {
             separateGainDb += smoothedRuntimeAutoGainDb.load();
+            separateRightGainDb += smoothedRuntimeAutoGainDb.load();
+        }
         auto firPoints = points;
+        auto rightFirPoints = rightPoints;
         if (! juce::approximatelyEqual (separateGainDb, 0.0))
             for (auto& point : firPoints)
                 point.db += separateGainDb;
+        if (! juce::approximatelyEqual (separateRightGainDb, 0.0))
+            for (auto& point : rightFirPoints)
+                point.db += separateRightGainDb;
         const auto phaseMode = getPhaseMode();
         const auto taps = getDefaultFirTapsForMode (phaseMode);
-        auto impulse = createImpulseForPhaseMode (firPoints, currentSampleRate, taps);
+        auto impulse = createStereoImpulseForPhaseMode (firPoints, rightFirPoints,
+                                                        currentSampleRate, taps);
         juce::WavAudioFormat wav;
         if (file.existsAsFile() && ! file.deleteFile())
             return false;
@@ -2399,64 +3198,79 @@ bool FlexCurveAudioProcessor::exportLayerToFile (int layerId, bool average, Curv
             return false;
         const auto metadata = makeFlexCurveFirMetadata (separateGainDb);
         std::unique_ptr<juce::AudioFormatWriter> writer (
-            wav.createWriterFor (stream.get(), currentSampleRate, 1, 32, metadata, 0));
+            wav.createWriterFor (stream.get(), currentSampleRate,
+                                 static_cast<unsigned int> (impulse.getNumChannels()),
+                                 32, metadata, 0));
         if (writer == nullptr)
             return false;
         stream.release();
         return writer->writeFromAudioSampleBuffer (impulse, 0, impulse.getNumSamples());
     }
 
-    juce::String text;
-    if (format == CurveExportFormat::graphicEq)
+    auto makeText = [this, format, average] (const std::vector<CurvePoint>& curve,
+                                             double channelGainDb)
     {
-        if (! average)
-            text << "Preamp: " << juce::String (separateGainDb, 5) << " dB" << newLine;
-        text << "GraphicEQ: ";
-        for (size_t i = 0; i < points.size(); ++i)
+        juce::String text;
+        if (format == CurveExportFormat::graphicEq)
         {
-            if (i != 0)
-                text << "; ";
-            text << juce::String (points[i].frequency, 3) << " " << juce::String (points[i].db, 4);
+            if (! average)
+                text << "Preamp: " << juce::String (channelGainDb, 5) << " dB" << newLine;
+            text << "GraphicEQ: ";
+            for (size_t i = 0; i < curve.size(); ++i)
+            {
+                if (i != 0)
+                    text << "; ";
+                text << juce::String (curve[i].frequency, 3) << " " << juce::String (curve[i].db, 4);
+            }
+            text << newLine;
         }
-        text << newLine;
-    }
-    else if (format == CurveExportFormat::apoParametric)
-    {
-        if (! average)
-            text << "Preamp: " << juce::String (separateGainDb, 5) << " dB" << newLine;
-        const auto parametric = approximateCurveWithParametricFilters (points);
-        for (const auto& band : parametric)
+        else if (format == CurveExportFormat::apoParametric)
         {
-            if (! band.enabled)
-                continue;
-            const auto type = band.type == FlexParamBand::peak ? "PK"
-                            : band.type == FlexParamBand::lowShelf ? "LS"
-                            : band.type == FlexParamBand::highShelf ? "HS"
-                            : band.type == FlexParamBand::lowPass ? "LP"
-                            : band.type == FlexParamBand::highPass ? "HP" : "NO";
-            text << "Filter: ON " << type << " Fc " << juce::String (band.frequency, 3) << " Hz";
-            if (band.type == FlexParamBand::peak || band.type == FlexParamBand::lowShelf || band.type == FlexParamBand::highShelf)
-                text << " Gain " << juce::String (band.gainDb, 3) << " dB";
-            text << " Q " << juce::String (band.q, 4) << newLine;
+            if (! average)
+                text << "Preamp: " << juce::String (channelGainDb, 5) << " dB" << newLine;
+            const auto parametric = approximateCurveWithParametricFilters (curve);
+            for (const auto& band : parametric)
+            {
+                if (! band.enabled)
+                    continue;
+                const auto type = band.type == FlexParamBand::peak ? "PK"
+                                : band.type == FlexParamBand::lowShelf ? "LS"
+                                : band.type == FlexParamBand::highShelf ? "HS"
+                                : band.type == FlexParamBand::lowPass ? "LP"
+                                : band.type == FlexParamBand::highPass ? "HP" : "NO";
+                text << "Filter: ON " << type << " Fc " << juce::String (band.frequency, 3) << " Hz";
+                if (band.type == FlexParamBand::peak || band.type == FlexParamBand::lowShelf || band.type == FlexParamBand::highShelf)
+                    text << " Gain " << juce::String (band.gainDb, 3) << " dB";
+                text << " Q " << juce::String (band.q, 4) << newLine;
+            }
         }
-        if (text.isEmpty())
-            return false;
-    }
-    else
-    {
-        if (format == CurveExportFormat::frequencyCsv)
-            text = "frequency,db\n";
-        else if (format == CurveExportFormat::meldaCsv)
-            text = "Frequency (Hz),Gain (dB)\n";
+        else
+        {
+            if (format == CurveExportFormat::frequencyCsv)
+                text = "frequency,db\n";
+            else if (format == CurveExportFormat::meldaCsv)
+                text = "Frequency (Hz),Gain (dB)\n";
+            const auto separator = format == CurveExportFormat::frequencyText ? "\t" : ",";
+            for (const auto& point : curve)
+                text << juce::String (point.frequency, 5) << separator
+                     << juce::String (point.db, 5) << newLine;
+        }
+        return text;
+    };
 
-        const auto separator = format == CurveExportFormat::frequencyText ? "\t" : ",";
-        for (const auto& point : points)
-            text << juce::String (point.frequency, 5) << separator << juce::String (point.db, 5) << newLine;
+    if (channelsDiffer)
+    {
+        const auto leftFile = file.getSiblingFile (
+            file.getFileNameWithoutExtension() + "_L" + file.getFileExtension());
+        const auto rightFile = file.getSiblingFile (
+            file.getFileNameWithoutExtension() + "_R" + file.getFileExtension());
+        return leftFile.replaceWithText (makeText (points, separateGainDb))
+            && rightFile.replaceWithText (makeText (rightPoints, separateRightGainDb));
     }
 
     if (file.existsAsFile() && ! file.deleteFile())
         return false;
-    return file.replaceWithText (text);
+    return file.replaceWithText (makeText (points, separateGainDb));
 }
 
 juce::String FlexCurveAudioProcessor::getStatusText() const
@@ -2521,6 +3335,35 @@ juce::AudioBuffer<float> FlexCurveAudioProcessor::createImpulseForPhaseMode (con
     return CurveFIR::createMixedPhaseFIR (points, sampleRate, taps);
 }
 
+juce::AudioBuffer<float> FlexCurveAudioProcessor::createStereoImpulseForPhaseMode (
+    const std::vector<CurvePoint>& leftPoints,
+    const std::vector<CurvePoint>& rightPoints,
+    double sampleRate,
+    int taps) const
+{
+    auto left = createImpulseForPhaseMode (leftPoints, sampleRate, taps);
+    if (getTotalNumOutputChannels() < 2)
+        return left;
+    bool equal = leftPoints.size() == rightPoints.size();
+    if (equal)
+        for (size_t i = 0; i < leftPoints.size(); ++i)
+            if (std::abs (leftPoints[i].db - rightPoints[i].db) > 1.0e-5
+                || std::abs (leftPoints[i].frequency - rightPoints[i].frequency) > 1.0e-5)
+            {
+                equal = false;
+                break;
+            }
+    if (equal)
+        return left;
+
+    auto right = createImpulseForPhaseMode (rightPoints, sampleRate, taps);
+    juce::AudioBuffer<float> stereo (2, juce::jmax (left.getNumSamples(), right.getNumSamples()));
+    stereo.clear();
+    stereo.copyFrom (0, 0, left, 0, 0, left.getNumSamples());
+    stereo.copyFrom (1, 0, right, 0, 0, right.getNumSamples());
+    return stereo;
+}
+
 int FlexCurveAudioProcessor::findImpulseResponsePeak (const juce::AudioBuffer<float>& impulse) const
 {
     int peakIndex = 0;
@@ -2561,20 +3404,41 @@ void FlexCurveAudioProcessor::updateMeters (const juce::AudioBuffer<float>& buff
         const auto previous = target.load();
         target.store (next >= previous ? next : previous * 0.88f + next * 0.12f);
     };
+    auto updateStage = [&stats, &updateBallistic] (auto& peakTargets, auto& rmsTargets,
+                                                   auto& momentaryTargets, auto& shortTargets,
+                                                   auto& integratedTargets)
+    {
+        for (size_t channel = 0; channel < 3; ++channel)
+        {
+            const auto channelPeakDb = juce::Decibels::gainToDecibels (stats.channelPeak[channel], -100.0f);
+            const auto channelRmsDb = juce::Decibels::gainToDecibels (
+                static_cast<float> (std::sqrt (juce::jmax (0.0, stats.channelMeanSquare[channel]))), -100.0f);
+            const auto channelLufs = approximateLufsFromRmsDb (channelRmsDb);
+            updateBallistic (peakTargets[channel], channelPeakDb);
+            updateBallistic (rmsTargets[channel], channelRmsDb);
+            updateBallistic (momentaryTargets[channel], channelLufs);
+            shortTargets[channel].store (shortTargets[channel].load() * 0.94f + channelLufs * 0.06f);
+            integratedTargets[channel].store (integratedTargets[channel].load() * 0.985f + channelLufs * 0.015f);
+        }
+    };
 
     if (input)
     {
         updateBallistic (inputPeakDb, peakDb);
         updateBallistic (inputRmsDb, rmsDb);
-        if (stats.peak > 1.0f)
-            inputClip.store (true);
+        updateStage (inputChannelPeakDb, inputChannelRmsDb, inputChannelLufsMomentary,
+                     inputChannelLufsShortTerm, inputChannelLufsIntegrated);
+        inputClip.store (stats.peak > 1.0f);
+        inputClipOverDb.store (stats.peak > 1.0f ? juce::Decibels::gainToDecibels (stats.peak, 0.0f) : 0.0f);
     }
     else
     {
         updateBallistic (outputPeakDb, peakDb);
         updateBallistic (outputRmsDb, rmsDb);
-        if (stats.peak > 1.0f)
-            outputClip.store (true);
+        updateStage (outputChannelPeakDb, outputChannelRmsDb, outputChannelLufsMomentary,
+                     outputChannelLufsShortTerm, outputChannelLufsIntegrated);
+        outputClip.store (stats.peak > 1.0f);
+        outputClipOverDb.store (stats.peak > 1.0f ? juce::Decibels::gainToDecibels (stats.peak, 0.0f) : 0.0f);
     }
 }
 
@@ -2650,6 +3514,27 @@ FlexCurveAudioProcessor::MeterSnapshot FlexCurveAudioProcessor::getMeterSnapshot
     result.preAutoClipped = preAutoClip.load();
     result.outputClipped = outputClip.load();
     result.autoGainDb = smoothedRuntimeAutoGainDb.load();
+    result.inputClipOverDb = inputClipOverDb.load();
+    result.preAutoClipOverDb = preAutoClipOverDb.load();
+    result.outputClipOverDb = outputClipOverDb.load();
+    for (size_t channel = 0; channel < 3; ++channel)
+    {
+        result.inputChannels[channel] = { inputChannelPeakDb[channel].load(),
+                                          inputChannelRmsDb[channel].load(),
+                                          inputChannelLufsMomentary[channel].load(),
+                                          inputChannelLufsShortTerm[channel].load(),
+                                          inputChannelLufsIntegrated[channel].load() };
+        result.preAutoChannels[channel] = { preAutoChannelPeakDb[channel].load(),
+                                            preAutoChannelRmsDb[channel].load(),
+                                            preAutoChannelLufsMomentary[channel].load(),
+                                            preAutoChannelLufsShortTerm[channel].load(),
+                                            preAutoChannelLufsIntegrated[channel].load() };
+        result.outputChannels[channel] = { outputChannelPeakDb[channel].load(),
+                                           outputChannelRmsDb[channel].load(),
+                                           outputChannelLufsMomentary[channel].load(),
+                                           outputChannelLufsShortTerm[channel].load(),
+                                           outputChannelLufsIntegrated[channel].load() };
+    }
     return result;
 }
 
@@ -2661,9 +3546,24 @@ void FlexCurveAudioProcessor::resetMeters() noexcept
     preAutoRmsDb.store (-100.0f);
     outputPeakDb.store (-100.0f);
     outputRmsDb.store (-100.0f);
+    for (size_t channel = 0; channel < 3; ++channel)
+    {
+        for (auto* value : { &inputChannelPeakDb[channel], &inputChannelRmsDb[channel],
+                             &inputChannelLufsMomentary[channel], &inputChannelLufsShortTerm[channel],
+                             &inputChannelLufsIntegrated[channel], &preAutoChannelPeakDb[channel],
+                             &preAutoChannelRmsDb[channel], &preAutoChannelLufsMomentary[channel],
+                             &preAutoChannelLufsShortTerm[channel], &preAutoChannelLufsIntegrated[channel],
+                             &outputChannelPeakDb[channel], &outputChannelRmsDb[channel],
+                             &outputChannelLufsMomentary[channel], &outputChannelLufsShortTerm[channel],
+                             &outputChannelLufsIntegrated[channel] })
+            value->store (-100.0f);
+    }
     inputClip.store (false);
     preAutoClip.store (false);
     outputClip.store (false);
+    inputClipOverDb.store (0.0f);
+    preAutoClipOverDb.store (0.0f);
+    outputClipOverDb.store (0.0f);
     inputPowerIntegrator = 0.0;
     outputPowerIntegrator = 0.0;
     autoGainSampleCount = 0;
@@ -2824,7 +3724,13 @@ double FlexCurveAudioProcessor::getBiquadMagnitudeDb (const Biquad& filter, doub
 void FlexCurveAudioProcessor::rebuildPreviewFilters()
 {
     previewFiltersDirty.store (false);
-    const auto points = getFinalCurve();
+    std::vector<CurvePoint> points;
+    std::vector<CurvePoint> rightPoints;
+    {
+        const juce::ScopedLock lock (projectLock);
+        points = calculateAverageCurveLocked (FlexChannelSelection::left);
+        rightPoints = calculateAverageCurveLocked (FlexChannelSelection::right);
+    }
     if (points.empty() || currentSampleRate <= 0.0)
     {
         previewFirReady.store (false);
@@ -2835,10 +3741,34 @@ void FlexCurveAudioProcessor::rebuildPreviewFilters()
     // minimum-phase FIR outside processBlock, then swapped into JUCE's
     // partitioned convolution engine.
     const auto taps = scaleReferenceSampleCount (minimumPhaseReferenceTaps);
-    auto impulse = CurveFIR::createMinimumPhaseFIR (points, currentSampleRate, taps);
+    const auto previousMode = parameters.getRawParameterValue ("phasemode")->load();
+    juce::ignoreUnused (previousMode);
+    auto leftImpulse = CurveFIR::createMinimumPhaseFIR (points, currentSampleRate, taps);
+    bool equal = points.size() == rightPoints.size();
+    if (getTotalNumOutputChannels() < 2)
+        equal = true;
+    if (equal)
+        for (size_t i = 0; i < points.size(); ++i)
+            if (std::abs (points[i].db - rightPoints[i].db) > 1.0e-5)
+            {
+                equal = false;
+                break;
+            }
+    juce::AudioBuffer<float> impulse;
+    if (equal)
+        impulse = std::move (leftImpulse);
+    else
+    {
+        auto rightImpulse = CurveFIR::createMinimumPhaseFIR (rightPoints, currentSampleRate, taps);
+        impulse.setSize (2, juce::jmax (leftImpulse.getNumSamples(), rightImpulse.getNumSamples()));
+        impulse.clear();
+        impulse.copyFrom (0, 0, leftImpulse, 0, 0, leftImpulse.getNumSamples());
+        impulse.copyFrom (1, 0, rightImpulse, 0, 0, rightImpulse.getNumSamples());
+    }
     previewConvolution.loadImpulseResponse (std::move (impulse),
                                             currentSampleRate,
-                                            juce::dsp::Convolution::Stereo::no,
+                                            equal ? juce::dsp::Convolution::Stereo::no
+                                                  : juce::dsp::Convolution::Stereo::yes,
                                             juce::dsp::Convolution::Trim::no,
                                             juce::dsp::Convolution::Normalise::no);
     previewFirReady.store (true);
@@ -2859,6 +3789,15 @@ void FlexCurveAudioProcessor::resetCrossfeed()
     crossfeedWrite = 0;
     lpL = 0.0f;
     lpR = 0.0f;
+    bs2bA0Lo = 0.0;
+    bs2bB1Lo = 0.0;
+    bs2bA0Hi = 1.0;
+    bs2bA1Hi = 0.0;
+    bs2bB1Hi = 0.0;
+    bs2bGain = 1.0;
+    bs2bLo[0] = bs2bLo[1] = 0.0;
+    bs2bHi[0] = bs2bHi[1] = 0.0;
+    bs2bPrevInput[0] = bs2bPrevInput[1] = 0.0;
 }
 
 void FlexCurveAudioProcessor::applyCrossfeed (juce::AudioBuffer<float>& buffer, float amount)
@@ -2868,12 +3807,70 @@ void FlexCurveAudioProcessor::applyCrossfeed (juce::AudioBuffer<float>& buffer, 
 
     auto* left = buffer.getWritePointer (0);
     auto* right = buffer.getWritePointer (1);
+    const auto algorithm = juce::roundToInt (parameters.getRawParameterValue ("crossfeedalgorithm")->load());
+    const auto sampleRate = currentSampleRate > 0.0 ? currentSampleRate : 48000.0;
+    const auto cutoffHz = juce::jlimit (200.0f, 2500.0f, parameters.getRawParameterValue ("crossfeedcutoff")->load());
+    const auto directGain = juce::jlimit (0.5f, 1.2f, parameters.getRawParameterValue ("crossfeeddirect")->load() / 100.0f);
+
+    if (algorithm == 1)
+    {
+        const auto feed = juce::jlimit (10.0, 150.0, 45.0 + static_cast<double> (amount) * 50.0) / 10.0;
+        const auto fcut = juce::jlimit (300.0, 2000.0, static_cast<double> (cutoffHz));
+        const auto gbLo = feed * -5.0 / 6.0 - 3.0;
+        const auto gbHi = feed / 6.0 - 3.0;
+        const auto gLo = dbToGain (gbLo);
+        const auto gHi = 1.0 - dbToGain (gbHi);
+        const auto fcHi = fcut * std::pow (2.0, (gbLo - 20.0 * std::log10 (juce::jmax (1.0e-9, gHi))) / 12.0);
+        auto x = std::exp (-juce::MathConstants<double>::twoPi * fcut / sampleRate);
+        bs2bB1Lo = x;
+        bs2bA0Lo = gLo * (1.0 - x);
+        x = std::exp (-juce::MathConstants<double>::twoPi * fcHi / sampleRate);
+        bs2bB1Hi = x;
+        bs2bA0Hi = 1.0 - gHi * (1.0 - x);
+        bs2bA1Hi = -x;
+        bs2bGain = 1.0 / (1.0 - gHi + gLo);
+
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            const auto inL = static_cast<double> (left[i]);
+            const auto inR = static_cast<double> (right[i]);
+            bs2bLo[0] = bs2bA0Lo * inL + bs2bB1Lo * bs2bLo[0];
+            bs2bLo[1] = bs2bA0Lo * inR + bs2bB1Lo * bs2bLo[1];
+            bs2bHi[0] = bs2bA0Hi * inL + bs2bA1Hi * bs2bPrevInput[0] + bs2bB1Hi * bs2bHi[0];
+            bs2bHi[1] = bs2bA0Hi * inR + bs2bA1Hi * bs2bPrevInput[1] + bs2bB1Hi * bs2bHi[1];
+            bs2bPrevInput[0] = inL;
+            bs2bPrevInput[1] = inR;
+            const auto wetL = (bs2bHi[0] + bs2bLo[1]) * bs2bGain * static_cast<double> (directGain);
+            const auto wetR = (bs2bHi[1] + bs2bLo[0]) * bs2bGain * static_cast<double> (directGain);
+            left[i] = static_cast<float> (inL + amount * (wetL - inL));
+            right[i] = static_cast<float> (inR + amount * (wetR - inR));
+        }
+        return;
+    }
+
     auto* delayL = crossfeedDelay.getWritePointer (0);
     auto* delayR = crossfeedDelay.getWritePointer (1);
     const auto delaySize = crossfeedDelay.getNumSamples();
-    const auto lpAlpha = static_cast<float> (1.0 - std::exp (-juce::MathConstants<double>::twoPi * 900.0 / currentSampleRate));
-    const auto width = juce::jmap (amount, 1.0f, 0.42f);
-    const auto feed = juce::jmap (amount, 0.0f, 0.28f);
+    const auto circumferenceCm = juce::jlimit (45.0f, 70.0f, parameters.getRawParameterValue ("crossfeedcircumference")->load());
+    const auto headWidthCm = juce::jlimit (10.0f, 22.0f, parameters.getRawParameterValue ("crossfeedheadwidth")->load());
+    const auto headLengthCm = juce::jlimit (14.0f, 25.0f, parameters.getRawParameterValue ("crossfeedheadlength")->load());
+    const auto angleDeg = juce::jlimit (10.0f, 90.0f, parameters.getRawParameterValue ("crossfeedangle")->load());
+    const auto theta = static_cast<double> (angleDeg) * juce::MathConstants<double>::pi / 180.0;
+    const auto halfHead = static_cast<double> (headWidthCm) / 200.0;
+    const auto frontOffset = static_cast<double> (headLengthCm) / 200.0;
+    const auto circumferenceRadius = static_cast<double> (circumferenceCm) / (2.0 * juce::MathConstants<double>::pi * 100.0);
+    const auto speakerDistance = 1.0 + frontOffset;
+    const auto dFar = std::sqrt (speakerDistance * speakerDistance + halfHead * halfHead
+                               + 2.0 * speakerDistance * halfHead * std::sin (theta * 0.5));
+    const auto dNear = std::sqrt (speakerDistance * speakerDistance + halfHead * halfHead
+                                - 2.0 * speakerDistance * halfHead * std::sin (theta * 0.5));
+    const auto pathDelay = (dFar - dNear) / 343.0;
+    const auto headShadowDelay = circumferenceRadius * std::sin (theta * 0.5) / 343.0;
+    const auto delaySeconds = juce::jmax (0.00005, 0.65 * pathDelay + 0.35 * headShadowDelay);
+    const auto delaySamples = juce::jlimit (1, delaySize - 1, static_cast<int> (std::round (delaySeconds * sampleRate)));
+    const auto lpAlpha = static_cast<float> (1.0 - std::exp (-juce::MathConstants<double>::twoPi * static_cast<double> (cutoffHz) / sampleRate));
+    const auto width = 1.0f + amount * (0.42f - 1.0f);
+    const auto feed = 0.16f * amount;
 
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
@@ -2881,15 +3878,26 @@ void FlexCurveAudioProcessor::applyCrossfeed (juce::AudioBuffer<float>& buffer, 
         const auto inR = right[i];
         delayL[crossfeedWrite] = inL;
         delayR[crossfeedWrite] = inR;
-        const auto read = (crossfeedWrite - juce::jmax (1, static_cast<int> (currentSampleRate * 0.00028)) + delaySize) % delaySize;
+        const auto read = (crossfeedWrite - delaySamples + delaySize) % delaySize;
         lpL += lpAlpha * (delayL[read] - lpL);
         lpR += lpAlpha * (delayR[read] - lpR);
         const auto mid = 0.5f * (inL + inR);
         const auto side = 0.5f * (inL - inR) * width;
-        left[i] = (mid + side) + feed * lpR;
-        right[i] = (mid - side) + feed * lpL;
+        left[i] = ((mid + side) + feed * lpR) * directGain;
+        right[i] = ((mid - side) + feed * lpL) * directGain;
         crossfeedWrite = (crossfeedWrite + 1) % delaySize;
     }
+}
+
+void FlexCurveAudioProcessor::applyGlobalBalance (juce::AudioBuffer<float>& buffer, float balanceDb) const
+{
+    if (buffer.getNumChannels() < 2 || std::abs (balanceDb) < 0.001f)
+        return;
+
+    const auto leftGain = juce::Decibels::decibelsToGain (channelBalanceOffsetDb (balanceDb, FlexChannelSelection::left));
+    const auto rightGain = juce::Decibels::decibelsToGain (channelBalanceOffsetDb (balanceDb, FlexChannelSelection::right));
+    buffer.applyGain (0, 0, buffer.getNumSamples(), leftGain);
+    buffer.applyGain (1, 0, buffer.getNumSamples(), rightGain);
 }
 
 void FlexCurveAudioProcessor::addLayersToState (juce::ValueTree& state) const
@@ -2910,6 +3918,8 @@ void FlexCurveAudioProcessor::addLayersToState (juce::ValueTree& state) const
         node.setProperty ("autoEqSourcesOutdated", layer.autoEqSourcesOutdated, nullptr);
         node.setProperty ("autoEqReferenceOffsetDb", layer.autoEqReferenceOffsetDb, nullptr);
         node.setProperty ("autoEqReferenceDisplayEnabled", layer.autoEqReferenceDisplayEnabled, nullptr);
+        node.setProperty ("selectedChannel", static_cast<int> (layer.selectedChannel), nullptr);
+        node.setProperty ("channelsLinked", layer.channelsLinked, nullptr);
         node.setProperty ("colour", static_cast<int> (layer.colour.getARGB()), nullptr);
         node.setProperty ("enabled", layer.enabled, nullptr);
         node.setProperty ("muted", layer.muted, nullptr);
@@ -2917,6 +3927,7 @@ void FlexCurveAudioProcessor::addLayersToState (juce::ValueTree& state) const
         node.setProperty ("visible", layer.visible, nullptr);
         node.setProperty ("inverted", layer.inverted, nullptr);
         node.setProperty ("gainDb", layer.gainDb, nullptr);
+        node.setProperty ("balanceDb", layer.balanceDb, nullptr);
         node.setProperty ("normalizationOffsetDb", layer.normalizationOffsetDb, nullptr);
         node.setProperty ("opacity", layer.opacity, nullptr);
         node.setProperty ("smoothSourceCurve", layer.smoothSourceCurve, nullptr);
@@ -2967,6 +3978,66 @@ void FlexCurveAudioProcessor::addLayersToState (juce::ValueTree& state) const
         }
         node.addChild (freeformTree, -1, nullptr);
 
+        juce::ValueTree rightTree ("RightChannel");
+        rightTree.setProperty ("autoEqMethod", layer.right.autoEqMethod, nullptr);
+        rightTree.setProperty ("autoEqSourcesOutdated", layer.right.autoEqSourcesOutdated, nullptr);
+        rightTree.setProperty ("autoEqReferenceOffsetDb", layer.right.autoEqReferenceOffsetDb, nullptr);
+        rightTree.setProperty ("autoEqReferenceDisplayEnabled", layer.right.autoEqReferenceDisplayEnabled, nullptr);
+        rightTree.setProperty ("inverted", layer.right.inverted, nullptr);
+        rightTree.setProperty ("gainDb", layer.right.gainDb, nullptr);
+        rightTree.setProperty ("normalizationOffsetDb", layer.right.normalizationOffsetDb, nullptr);
+        rightTree.setProperty ("smoothSourceCurve", layer.right.smoothSourceCurve, nullptr);
+        rightTree.setProperty ("blendBassGainDb", layer.right.blend.bassGainDb, nullptr);
+        rightTree.setProperty ("blendMidGainDb", layer.right.blend.midGainDb, nullptr);
+        rightTree.setProperty ("blendTrebleGainDb", layer.right.blend.trebleGainDb, nullptr);
+        rightTree.setProperty ("blendLowMidHz", layer.right.blend.lowMidCrossoverHz, nullptr);
+        rightTree.setProperty ("blendMidHighHz", layer.right.blend.midHighCrossoverHz, nullptr);
+        rightTree.setProperty ("graphicEnabled", layer.right.graphicEnabled, nullptr);
+        rightTree.setProperty ("graphicMode", layer.right.graphicMode, nullptr);
+        rightTree.setProperty ("preserveVariableShapeAcrossModes",
+                               layer.right.preserveVariableShapeAcrossModes, nullptr);
+        rightTree.setProperty ("smoothGraphicCurve", layer.right.smoothGraphicCurve, nullptr);
+        for (int g = 0; g < 15; ++g)
+            rightTree.setProperty ("graphic15_" + juce::String (g),
+                                   layer.right.graphic15Gains[static_cast<size_t> (g)], nullptr);
+        for (int g = 0; g < 31; ++g)
+            rightTree.setProperty ("graphic31_" + juce::String (g),
+                                   layer.right.graphic31Gains[static_cast<size_t> (g)], nullptr);
+
+        juce::ValueTree rightPoints ("Points");
+        for (const auto& point : layer.right.points)
+        {
+            juce::ValueTree p ("Point");
+            p.setProperty ("f", point.frequency, nullptr);
+            p.setProperty ("db", point.db, nullptr);
+            rightPoints.addChild (p, -1, nullptr);
+        }
+        rightTree.addChild (rightPoints, -1, nullptr);
+
+        juce::ValueTree rightParams ("Parametric");
+        for (const auto& band : layer.right.paramBands)
+        {
+            juce::ValueTree bandNode ("Band");
+            bandNode.setProperty ("enabled", band.enabled, nullptr);
+            bandNode.setProperty ("type", static_cast<int> (band.type), nullptr);
+            bandNode.setProperty ("frequency", band.frequency, nullptr);
+            bandNode.setProperty ("gainDb", band.gainDb, nullptr);
+            bandNode.setProperty ("q", band.q, nullptr);
+            rightParams.addChild (bandNode, -1, nullptr);
+        }
+        rightTree.addChild (rightParams, -1, nullptr);
+
+        juce::ValueTree rightFreeform ("Freeform");
+        for (const auto& point : layer.right.freeformPoints)
+        {
+            juce::ValueTree p ("Point");
+            p.setProperty ("f", point.frequency, nullptr);
+            p.setProperty ("db", point.db, nullptr);
+            rightFreeform.addChild (p, -1, nullptr);
+        }
+        rightTree.addChild (rightFreeform, -1, nullptr);
+        node.addChild (rightTree, -1, nullptr);
+
         layersTree.addChild (node, -1, nullptr);
     }
 
@@ -2988,6 +4059,16 @@ void FlexCurveAudioProcessor::addRenderedCurveToState (juce::ValueTree& state) c
         node.setProperty ("db", point.db, nullptr);
         renderedTree.addChild (node, -1, nullptr);
     }
+
+    juce::ValueTree rightTree ("Right");
+    for (const auto& point : renderedCurveRight)
+    {
+        juce::ValueTree node ("Point");
+        node.setProperty ("f", point.frequency, nullptr);
+        node.setProperty ("db", point.db, nullptr);
+        rightTree.addChild (node, -1, nullptr);
+    }
+    renderedTree.addChild (rightTree, -1, nullptr);
 
     state.addChild (renderedTree, -1, nullptr);
 }
@@ -3018,6 +4099,9 @@ void FlexCurveAudioProcessor::restoreLayersFromState (const juce::ValueTree& sta
         layer.autoEqReferenceOffsetDb = static_cast<float> (node.getProperty ("autoEqReferenceOffsetDb", 0.0f));
         layer.autoEqReferenceDisplayEnabled
             = static_cast<bool> (node.getProperty ("autoEqReferenceDisplayEnabled", true));
+        layer.selectedChannel = static_cast<FlexChannelSelection> (juce::jlimit (
+            0, 2, static_cast<int> (node.getProperty ("selectedChannel", 0))));
+        layer.channelsLinked = static_cast<bool> (node.getProperty ("channelsLinked", true));
         layer.colour = juce::Colour (static_cast<juce::uint32> (static_cast<int> (node.getProperty ("colour", static_cast<int> (layerColourForIndex (i).getARGB())))));
         layer.enabled = static_cast<bool> (node.getProperty ("enabled", true));
         layer.muted = static_cast<bool> (node.getProperty ("muted", ! layer.enabled));
@@ -3025,6 +4109,7 @@ void FlexCurveAudioProcessor::restoreLayersFromState (const juce::ValueTree& sta
         layer.visible = static_cast<bool> (node.getProperty ("visible", true));
         layer.inverted = static_cast<bool> (node.getProperty ("inverted", false));
         layer.gainDb = static_cast<float> (node.getProperty ("gainDb", 0.0f));
+        layer.balanceDb = static_cast<float> (node.getProperty ("balanceDb", 0.0f));
         layer.normalizationOffsetDb = static_cast<float> (node.getProperty ("normalizationOffsetDb", 0.0f));
         layer.opacity = static_cast<float> (node.getProperty ("opacity", 1.0f));
         layer.smoothSourceCurve = static_cast<bool> (node.getProperty ("smoothSourceCurve", false));
@@ -3082,6 +4167,99 @@ void FlexCurveAudioProcessor::restoreLayersFromState (const juce::ValueTree& sta
                                               static_cast<double> (pointNode.getProperty ("db", 0.0)) });
         }
 
+        copyLeftChannelToRight (layer);
+        const auto rightTree = node.getChildWithName ("RightChannel");
+        if (rightTree.isValid())
+        {
+            layer.right.autoEqMethod = rightTree.getProperty ("autoEqMethod", layer.autoEqMethod).toString();
+            layer.right.autoEqSourcesOutdated = static_cast<bool> (
+                rightTree.getProperty ("autoEqSourcesOutdated", layer.autoEqSourcesOutdated));
+            layer.right.autoEqReferenceOffsetDb = static_cast<float> (
+                rightTree.getProperty ("autoEqReferenceOffsetDb", layer.autoEqReferenceOffsetDb));
+            layer.right.autoEqReferenceDisplayEnabled = static_cast<bool> (
+                rightTree.getProperty ("autoEqReferenceDisplayEnabled",
+                                       layer.autoEqReferenceDisplayEnabled));
+            layer.right.inverted = static_cast<bool> (
+                rightTree.getProperty ("inverted", layer.inverted));
+            layer.right.gainDb = static_cast<float> (
+                rightTree.getProperty ("gainDb", layer.gainDb));
+            layer.right.normalizationOffsetDb = static_cast<float> (
+                rightTree.getProperty ("normalizationOffsetDb", layer.normalizationOffsetDb));
+            layer.right.smoothSourceCurve = static_cast<bool> (
+                rightTree.getProperty ("smoothSourceCurve", layer.smoothSourceCurve));
+            layer.right.blend.bassGainDb = static_cast<float> (
+                rightTree.getProperty ("blendBassGainDb", layer.blend.bassGainDb));
+            layer.right.blend.midGainDb = static_cast<float> (
+                rightTree.getProperty ("blendMidGainDb", layer.blend.midGainDb));
+            layer.right.blend.trebleGainDb = static_cast<float> (
+                rightTree.getProperty ("blendTrebleGainDb", layer.blend.trebleGainDb));
+            layer.right.blend.lowMidCrossoverHz = static_cast<float> (
+                rightTree.getProperty ("blendLowMidHz", layer.blend.lowMidCrossoverHz));
+            layer.right.blend.midHighCrossoverHz = static_cast<float> (
+                rightTree.getProperty ("blendMidHighHz", layer.blend.midHighCrossoverHz));
+            layer.right.graphicEnabled = static_cast<bool> (
+                rightTree.getProperty ("graphicEnabled", layer.graphicEnabled));
+            layer.right.graphicMode = static_cast<int> (
+                rightTree.getProperty ("graphicMode", layer.graphicMode));
+            layer.right.preserveVariableShapeAcrossModes = static_cast<bool> (
+                rightTree.getProperty ("preserveVariableShapeAcrossModes",
+                                       layer.preserveVariableShapeAcrossModes));
+            layer.right.smoothGraphicCurve = static_cast<bool> (
+                rightTree.getProperty ("smoothGraphicCurve", layer.smoothGraphicCurve));
+            for (int g = 0; g < 15; ++g)
+                layer.right.graphic15Gains[static_cast<size_t> (g)] = static_cast<float> (
+                    rightTree.getProperty ("graphic15_" + juce::String (g),
+                                           layer.graphic15Gains[static_cast<size_t> (g)]));
+            for (int g = 0; g < 31; ++g)
+                layer.right.graphic31Gains[static_cast<size_t> (g)] = static_cast<float> (
+                    rightTree.getProperty ("graphic31_" + juce::String (g),
+                                           layer.graphic31Gains[static_cast<size_t> (g)]));
+
+            const auto rightPoints = rightTree.getChildWithName ("Points");
+            layer.right.points.clear();
+            for (int p = 0; p < rightPoints.getNumChildren(); ++p)
+            {
+                const auto pointNode = rightPoints.getChild (p);
+                layer.right.points.push_back ({
+                    static_cast<double> (pointNode.getProperty ("f", 0.0)),
+                    static_cast<double> (pointNode.getProperty ("db", 0.0)) });
+            }
+            if (layer.right.points.empty())
+                layer.right.points = layer.points;
+
+            const auto rightParams = rightTree.getChildWithName ("Parametric");
+            layer.right.paramBands.clear();
+            for (int b = 0; b < rightParams.getNumChildren(); ++b)
+            {
+                const auto bandNode = rightParams.getChild (b);
+                FlexParamBand band;
+                band.enabled = static_cast<bool> (bandNode.getProperty ("enabled", false));
+                band.type = static_cast<FlexParamBand::Type> (
+                    static_cast<int> (bandNode.getProperty ("type", 0)));
+                band.frequency = static_cast<float> (bandNode.getProperty ("frequency", 1000.0f));
+                band.gainDb = static_cast<float> (bandNode.getProperty ("gainDb", 0.0f));
+                band.q = static_cast<float> (bandNode.getProperty ("q", 1.0f));
+                layer.right.paramBands.push_back (band);
+            }
+            if (layer.right.paramBands.empty())
+                layer.right.paramBands.resize (8);
+
+            const auto rightFreeform = rightTree.getChildWithName ("Freeform");
+            layer.right.freeformPoints.clear();
+            for (int f = 0; f < rightFreeform.getNumChildren(); ++f)
+            {
+                const auto pointNode = rightFreeform.getChild (f);
+                layer.right.freeformPoints.push_back ({
+                    static_cast<double> (pointNode.getProperty ("f", 0.0)),
+                    static_cast<double> (pointNode.getProperty ("db", 0.0)) });
+            }
+        }
+        else
+        {
+            layer.selectedChannel = FlexChannelSelection::stereo;
+            layer.channelsLinked = true;
+        }
+
         if (! layer.points.empty())
         {
             const auto duplicateColour = std::any_of (restored.begin(), restored.end(), [&layer] (const auto& existing)
@@ -3107,24 +4285,38 @@ void FlexCurveAudioProcessor::restoreLayersFromState (const juce::ValueTree& sta
 void FlexCurveAudioProcessor::restoreRenderedCurveFromState (const juce::ValueTree& state)
 {
     std::vector<CurvePoint> restored;
+    std::vector<CurvePoint> restoredRight;
     const auto renderedTree = state.getChildWithName ("RenderedCurve");
     for (int i = 0; i < renderedTree.getNumChildren(); ++i)
     {
         const auto node = renderedTree.getChild (i);
-        restored.push_back ({ static_cast<double> (node.getProperty ("f", 0.0)),
-                              static_cast<double> (node.getProperty ("db", 0.0)) });
+        if (node.hasType ("Point"))
+            restored.push_back ({ static_cast<double> (node.getProperty ("f", 0.0)),
+                                  static_cast<double> (node.getProperty ("db", 0.0)) });
     }
+    const auto rightTree = renderedTree.getChildWithName ("Right");
+    for (int i = 0; i < rightTree.getNumChildren(); ++i)
+    {
+        const auto node = rightTree.getChild (i);
+        restoredRight.push_back ({ static_cast<double> (node.getProperty ("f", 0.0)),
+                                   static_cast<double> (node.getProperty ("db", 0.0)) });
+    }
+    if (restoredRight.empty())
+        restoredRight = restored;
 
     const juce::ScopedLock lock (projectLock);
     renderedCurve = std::move (restored);
+    renderedCurveRight = std::move (restoredRight);
 }
 
 bool FlexCurveAudioProcessor::rebuildConvolutionFromRenderedCurve()
 {
     std::vector<CurvePoint> points;
+    std::vector<CurvePoint> rightPoints;
     {
         const juce::ScopedLock lock (projectLock);
         points = renderedCurve;
+        rightPoints = renderedCurveRight.empty() ? renderedCurve : renderedCurveRight;
     }
 
     if (points.empty() || currentSampleRate <= 0.0)
@@ -3132,13 +4324,14 @@ bool FlexCurveAudioProcessor::rebuildConvolutionFromRenderedCurve()
 
     const auto phaseMode = getPhaseMode();
     const auto taps = getDefaultFirTapsForMode (phaseMode);
-    auto impulse = createImpulseForPhaseMode (points, currentSampleRate, taps);
+    auto impulse = createStereoImpulseForPhaseMode (points, rightPoints, currentSampleRate, taps);
 
     activeImpulsePeakSamples = findImpulseResponsePeak (impulse);
     applyActiveLatency (getLatencyForPhaseMode (phaseMode, impulse.getNumSamples()));
     convolution.loadImpulseResponse (std::move (impulse),
                                      currentSampleRate,
-                                     juce::dsp::Convolution::Stereo::no,
+                                     impulse.getNumChannels() > 1 ? juce::dsp::Convolution::Stereo::yes
+                                                                  : juce::dsp::Convolution::Stereo::no,
                                      juce::dsp::Convolution::Trim::no,
                                      juce::dsp::Convolution::Normalise::no);
     return true;
@@ -3314,8 +4507,13 @@ void FlexCurveAudioProcessor::setStateInformation (const void* data, int sizeInB
                                                        static_cast<double> (node.getProperty ("db", 0.0)) });
                 }
             }
+
+            copyLeftChannelToRight (*layer);
+            layer->channelsLinked = true;
+            layer->selectedChannel = FlexChannelSelection::stereo;
         }
         finalCurve = calculateFinalCurveLocked();
+        finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
     }
 
     {
@@ -3325,6 +4523,7 @@ void FlexCurveAudioProcessor::setStateInformation (const void* data, int sizeInB
         if (activeLayerId > 0 && findLayer (activeLayerId) == nullptr)
             activeLayerId = layers.empty() ? 0 : layers.front().id;
         finalCurve = calculateFinalCurveLocked();
+        finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
     }
 
     const auto shouldHaveRenderedFir = static_cast<bool> (state.getProperty ("hasRenderedFir", false));

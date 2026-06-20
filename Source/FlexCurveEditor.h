@@ -187,7 +187,13 @@ private:
     bool paintingFreeform = false;
     juce::Point<float> lastPaintPosition { -1000.0f, -1000.0f };
     float paintDistanceToNextPoint = 6.0f;
-    std::vector<std::pair<juce::Rectangle<float>, int>> legendHitBoxes;
+    struct LegendHitBox
+    {
+        juce::Rectangle<float> bounds;
+        int layerId = 0;
+        FlexChannelSelection channel = FlexChannelSelection::stereo;
+    };
+    std::vector<LegendHitBox> legendHitBoxes;
     bool variableEditingAllowed = false;
     double viewZoom = 1.0;
     double viewCentreDb = 0.0;
@@ -223,6 +229,7 @@ private:
     void updateAddButtons();
     void moveUiIntoScaledContent();
     void applyUiScalePreset (float scale);
+    void openCrossfeedAdvanced();
 
     FlexCurveAudioProcessor& processor;
     juce::Component scaledContent;
@@ -234,6 +241,10 @@ private:
     std::unique_ptr<GlobalLayerRack> globalLayerRack;
     std::unique_ptr<MeterPanel> meterPanel;
     std::unique_ptr<GraphResizeHandle> graphResizeHandle;
+    juce::Component globalControlsContent;
+    juce::Viewport globalControlsViewport { "GlobalControlsViewport" };
+    juce::Component levelsContent;
+    juce::Viewport levelsViewport { "LevelsViewport" };
 
     juce::Label title;
     juce::Label status;
@@ -255,6 +266,7 @@ private:
     juce::ComboBox uiScale;
     juce::Label dryWetLabel;
     juce::Label crossfeedLabel;
+    juce::Label globalBalanceLabel;
     juce::Label gainLabel;
     juce::Label inputGainLabel;
     juce::Label outputGainLabel;
@@ -262,6 +274,7 @@ private:
     juce::Label globalControlsLabel;
     FlexCurveResettableSlider dryWet;
     FlexCurveResettableSlider crossfeed;
+    FlexCurveResettableSlider globalBalance;
     FlexCurveResettableSlider gain;
     FlexCurveResettableSlider inputGain;
     FlexCurveResettableSlider outputGain;
@@ -270,7 +283,8 @@ private:
     juce::ComboBox loudnessMatchMode;
     juce::ToggleButton includeOutputGainFir { "Include Output Gain in FIR export" };
     juce::ToggleButton includeAutoGainFir { "Include Auto Gain in FIR export" };
-    juce::TextButton resetMeters { "Reset Meters" };
+    juce::ToggleButton independentLrPreamp { "Independent L/R AutoEQ Preamp" };
+    juce::TextButton crossfeedAdvanced { "Advanced" };
     FlexCurveLockButton lockMode;
     FlexCurveHistoryButton undoButton { true };
     FlexCurveHistoryButton redoButton { false };
@@ -285,6 +299,7 @@ private:
     using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
     std::unique_ptr<SliderAttachment> dryWetAttachment;
     std::unique_ptr<SliderAttachment> crossfeedAttachment;
+    std::unique_ptr<SliderAttachment> globalBalanceAttachment;
     std::unique_ptr<SliderAttachment> gainAttachment;
     std::unique_ptr<SliderAttachment> inputGainAttachment;
     std::unique_ptr<SliderAttachment> outputGainAttachment;
@@ -295,9 +310,10 @@ private:
     std::unique_ptr<ComboBoxAttachment> loudnessMatchAttachment;
     std::unique_ptr<ButtonAttachment> includeOutputGainFirAttachment;
     std::unique_ptr<ButtonAttachment> includeAutoGainFirAttachment;
+    std::unique_ptr<ButtonAttachment> independentLrPreampAttachment;
     static constexpr int designWidth = 1680;
     static constexpr int designHeight = 1040;
-    int graphSectionHeight = 430;
-    int globalControlsWidth = 560;
+    int graphSectionHeight = 500;
+    int globalControlsWidth = 720;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FlexCurveAudioProcessorEditor)
 };

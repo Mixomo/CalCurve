@@ -45,6 +45,11 @@ target_compile_definitions(FlexCurve
         JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0)
 
+if(MSVC)
+    target_compile_options(FlexCurve PRIVATE "$<$<CONFIG:Release>:/Zi>")
+    target_link_options(FlexCurve PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>" "$<$<CONFIG:Release>:/MAP>")
+endif()
+
 target_link_libraries(FlexCurve
     PRIVATE
         juce::juce_audio_utils

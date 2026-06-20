@@ -39,6 +39,35 @@ enum class FlexCurveLayerType
     raw = 2
 };
 
+enum class FlexChannelSelection
+{
+    stereo = 0,
+    left = 1,
+    right = 2
+};
+
+struct FlexCurveChannelState
+{
+    juce::String autoEqMethod;
+    bool autoEqSourcesOutdated = false;
+    float autoEqReferenceOffsetDb = 0.0f;
+    bool autoEqReferenceDisplayEnabled = true;
+    std::vector<CurvePoint> points;
+    bool inverted = false;
+    float gainDb = 0.0f;
+    float normalizationOffsetDb = 0.0f;
+    bool smoothSourceCurve = false;
+    FlexBlendSettings blend;
+    bool graphicEnabled = false;
+    int graphicMode = 31;
+    bool preserveVariableShapeAcrossModes = false;
+    bool smoothGraphicCurve = false;
+    std::array<float, 15> graphic15Gains {};
+    std::array<float, 31> graphic31Gains {};
+    std::vector<FlexParamBand> paramBands;
+    std::vector<CurvePoint> freeformPoints;
+};
+
 struct FlexCurveLayer
 {
     int id = 0;
@@ -59,6 +88,7 @@ struct FlexCurveLayer
     bool visible = true;
     bool inverted = false;
     float gainDb = 0.0f;
+    float balanceDb = 0.0f;
     float normalizationOffsetDb = 0.0f;
     float opacity = 1.0f;
     bool smoothSourceCurve = false;
@@ -71,6 +101,9 @@ struct FlexCurveLayer
     std::array<float, 31> graphic31Gains {};
     std::vector<FlexParamBand> paramBands;
     std::vector<CurvePoint> freeformPoints;
+    FlexCurveChannelState right;
+    FlexChannelSelection selectedChannel = FlexChannelSelection::stereo;
+    bool channelsLinked = true;
 };
 
 class FlexCurveAudioProcessor final : public juce::AudioProcessor,
@@ -80,6 +113,15 @@ class FlexCurveAudioProcessor final : public juce::AudioProcessor,
 public:
     struct MeterSnapshot
     {
+        struct Channel
+        {
+            float peakDb = -100.0f;
+            float rmsDb = -100.0f;
+            float lufsMomentary = -100.0f;
+            float lufsShortTerm = -100.0f;
+            float lufsIntegrated = -100.0f;
+        };
+
         float inputPeakDb = -100.0f;
         float inputRmsDb = -100.0f;
         float preAutoPeakDb = -100.0f;
@@ -92,6 +134,12 @@ public:
         bool preAutoClipped = false;
         bool outputClipped = false;
         float autoGainDb = 0.0f;
+        float inputClipOverDb = 0.0f;
+        float preAutoClipOverDb = 0.0f;
+        float outputClipOverDb = 0.0f;
+        std::array<Channel, 3> inputChannels {};
+        std::array<Channel, 3> preAutoChannels {};
+        std::array<Channel, 3> outputChannels {};
     };
 
     enum class AutoEqMode
@@ -160,6 +208,11 @@ public:
     void setLayerVisible (int id, bool visible);
     void setLayerSolo (int id, bool solo);
     void setLayerGain (int id, float gainDb);
+    void setLayerBalance (int id, float balanceDb);
+    void setLayerChannelSelection (int id, FlexChannelSelection channel);
+    FlexChannelSelection getLayerChannelSelection (int id) const;
+    bool areLayerChannelsLinked (int id) const;
+    void linkLayerChannels (int id);
     void setLayerSourceSmoothing (int id, bool enabled);
     void toggleLayerInverted (int id);
     void setLayerOpacity (int id, float opacity);
@@ -180,12 +233,21 @@ public:
     std::vector<CurvePoint> getFinalCurve() const;
     std::vector<CurvePoint> getRenderedCurve() const;
     std::vector<CurvePoint> getLayerCurve (int id) const;
+    std::vector<CurvePoint> getLayerCurve (int id, FlexChannelSelection channel) const;
     std::vector<CurvePoint> getLayerCurveForDisplay (int id) const;
+    std::vector<CurvePoint> getLayerCurveForDisplay (int id, FlexChannelSelection channel) const;
     std::vector<CurvePoint> getLayerCurveWithoutFreeform (int id) const;
     std::vector<CurvePoint> getAverageCurve() const;
+    std::vector<CurvePoint> getAverageCurve (FlexChannelSelection channel) const;
+    bool averageChannelsDiffer() const;
     std::vector<CurvePoint> getAverageCurveForType (FlexCurveLayerType type) const;
+    std::vector<CurvePoint> getAverageCurveForType (
+        FlexCurveLayerType type, FlexChannelSelection channel) const;
     std::vector<CurvePoint> getAverageCurveForTypeForDisplay (FlexCurveLayerType type) const;
+    std::vector<CurvePoint> getAverageCurveForTypeForDisplay (
+        FlexCurveLayerType type, FlexChannelSelection channel) const;
     std::vector<CurvePoint> getCorrectedMeasurementCurve (int eqLayerId) const;
+    std::vector<CurvePoint> getCorrectedMeasurementCurve (int eqLayerId, FlexChannelSelection channel) const;
     double getAutoEqResidualRmsDb (int eqLayerId) const;
     float getGlobalDbRange() const noexcept { return globalDbRange.load(); }
     void setGlobalDbRange (float rangeDb);
@@ -296,20 +358,42 @@ private:
     FlexCurveLayer* getActiveLayer();
     const FlexCurveLayer* getActiveLayer() const;
     std::vector<CurvePoint> calculateLayerCurveLocked (const FlexCurveLayer& layer) const;
-    std::vector<CurvePoint> calculateLayerCurveWithoutFreeformLocked (const FlexCurveLayer& layer) const;
-    std::vector<CurvePoint> calculateAverageCurveLocked() const;
+    std::vector<CurvePoint> calculateLayerCurveLocked (const FlexCurveLayer& layer,
+                                                        FlexChannelSelection channel) const;
+    std::vector<CurvePoint> calculateLayerCurveWithoutFreeformLocked (
+        const FlexCurveLayer& layer, FlexChannelSelection channel) const;
+    std::vector<CurvePoint> calculateAverageCurveLocked (
+        FlexChannelSelection channel = FlexChannelSelection::left) const;
     std::vector<CurvePoint> calculateAverageCurveForTypeLocked (FlexCurveLayerType type,
-                                                                 bool applyReferenceDisplayOffset = false) const;
+                                                                 bool applyReferenceDisplayOffset = false,
+                                                                 FlexChannelSelection channel = FlexChannelSelection::left) const;
     std::vector<CurvePoint> calculateFinalCurveLocked() const;
-    std::vector<CurvePoint> calculateCorrectedMeasurementLocked (const FlexCurveLayer& eqLayer) const;
+    std::vector<CurvePoint> calculateCorrectedMeasurementLocked (
+        const FlexCurveLayer& eqLayer,
+        FlexChannelSelection channel = FlexChannelSelection::left) const;
     const FlexCurveLayer* findAutoEqDisplayContextLocked (int referenceLayerId) const;
-    float getReferenceDisplayOffsetLocked (int referenceLayerId) const;
+    float getReferenceDisplayOffsetLocked (
+        int referenceLayerId,
+        FlexChannelSelection channel = FlexChannelSelection::left) const;
     bool isEqLayerAudibleLocked (const FlexCurveLayer& layer) const;
     void markLinkedAutoEqLayersOutdatedLocked (int referenceLayerId);
     ParsedCurveData loadCurveData (const juce::File& file) const;
+    static void copyLeftChannelToRight (FlexCurveLayer& layer);
+    static void copyRightChannelToLeft (FlexCurveLayer& layer);
+    static void loadRightChannelIntoLayerView (const FlexCurveLayer& source, FlexCurveLayer& destination);
+    static void saveLayerViewIntoRightChannel (const FlexCurveLayer& source, FlexCurveLayer& destination);
+    void applyToSelectedChannelsLocked (FlexCurveLayer& layer,
+                                        const std::function<void(FlexCurveLayer&)>& operation);
+    FlexChannelSelection getDisplayChannelLocked (const FlexCurveLayer& layer) const;
+    juce::AudioBuffer<float> createStereoImpulseForPhaseMode (
+        const std::vector<CurvePoint>& leftPoints,
+        const std::vector<CurvePoint>& rightPoints,
+        double sampleRate,
+        int taps) const;
     void rebuildPreviewFilters();
     void applyPreviewFilters (juce::AudioBuffer<float>& buffer);
     void applyCrossfeed (juce::AudioBuffer<float>& buffer, float amount);
+    void applyGlobalBalance (juce::AudioBuffer<float>& buffer, float balanceDb) const;
     void resetCrossfeed();
     void updateMeters (const juce::AudioBuffer<float>& buffer, bool input);
     void updateRuntimeAutoGain (float inputPower, float outputPower, float outputPeak,
@@ -351,7 +435,9 @@ private:
     mutable juce::CriticalSection projectLock;
     std::vector<FlexCurveLayer> layers;
     std::vector<CurvePoint> finalCurve;
+    std::vector<CurvePoint> finalCurveRight;
     std::vector<CurvePoint> renderedCurve;
+    std::vector<CurvePoint> renderedCurveRight;
     int nextLayerId = 1;
     int activeLayerId = 0;
     bool averageEnabled = true;
@@ -369,6 +455,8 @@ private:
     };
     EqClipboardKind copiedEqKind = EqClipboardKind::none;
     bool copiedSmoothGraphicCurve = false;
+    int copiedEqSourceLayerId = 0;
+    FlexChannelSelection copiedEqSourceChannel = FlexChannelSelection::stereo;
     std::array<float, 15> copiedGraphic15Gains {};
     std::array<float, 31> copiedGraphic31Gains {};
     std::vector<FlexParamBand> copiedParamBands;
@@ -389,9 +477,27 @@ private:
     std::atomic<float> preAutoRmsDb { -100.0f };
     std::atomic<float> outputPeakDb { -100.0f };
     std::atomic<float> outputRmsDb { -100.0f };
+    std::array<std::atomic<float>, 3> inputChannelPeakDb;
+    std::array<std::atomic<float>, 3> inputChannelRmsDb;
+    std::array<std::atomic<float>, 3> inputChannelLufsMomentary;
+    std::array<std::atomic<float>, 3> inputChannelLufsShortTerm;
+    std::array<std::atomic<float>, 3> inputChannelLufsIntegrated;
+    std::array<std::atomic<float>, 3> preAutoChannelPeakDb;
+    std::array<std::atomic<float>, 3> preAutoChannelRmsDb;
+    std::array<std::atomic<float>, 3> preAutoChannelLufsMomentary;
+    std::array<std::atomic<float>, 3> preAutoChannelLufsShortTerm;
+    std::array<std::atomic<float>, 3> preAutoChannelLufsIntegrated;
+    std::array<std::atomic<float>, 3> outputChannelPeakDb;
+    std::array<std::atomic<float>, 3> outputChannelRmsDb;
+    std::array<std::atomic<float>, 3> outputChannelLufsMomentary;
+    std::array<std::atomic<float>, 3> outputChannelLufsShortTerm;
+    std::array<std::atomic<float>, 3> outputChannelLufsIntegrated;
     std::atomic<bool> inputClip { false };
     std::atomic<bool> preAutoClip { false };
     std::atomic<bool> outputClip { false };
+    std::atomic<float> inputClipOverDb { 0.0f };
+    std::atomic<float> preAutoClipOverDb { 0.0f };
+    std::atomic<float> outputClipOverDb { 0.0f };
 
     double currentSampleRate = 48000.0;
     float limiterGain = 1.0f;
@@ -400,6 +506,15 @@ private:
     int crossfeedWrite = 0;
     float lpL = 0.0f;
     float lpR = 0.0f;
+    double bs2bA0Lo = 0.0;
+    double bs2bB1Lo = 0.0;
+    double bs2bA0Hi = 1.0;
+    double bs2bA1Hi = 0.0;
+    double bs2bB1Hi = 0.0;
+    double bs2bGain = 1.0;
+    double bs2bLo[2] = {};
+    double bs2bHi[2] = {};
+    double bs2bPrevInput[2] = {};
 
     mutable juce::CriticalSection historyLock;
     std::vector<juce::MemoryBlock> undoHistory;

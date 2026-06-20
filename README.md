@@ -42,6 +42,21 @@ FlexCurve reads WAV FIR files as magnitude responses and regenerates them intern
 
 When a text/APO curve declares a global `Preamp` or gain directive, FlexCurve separates that value from the curve geometry and places it in the layer Gain control. FlexCurve-exported FIR WAV files store the same layer gain in WAV metadata, so reimporting them restores the editable gain without applying it twice. External FIR files without explicit FlexCurve gain metadata retain their measured magnitude response and use a safe default layer gain of `0.0 dB`; FlexCurve does not guess or destructively normalize their level.
 
+## Current Build State
+
+As of June 20, 2026, the FlexCurve branch contains the current VST3-only release candidate:
+
+- non-destructive EQ, Target, and RAW layer editing with up to six user EQ layers
+- independent L/R layer state, channel selection, linking, split-channel render/export, and per-layer balance trim
+- live Minimum-phase FIR preview with rendered Minimum, Natural, and Linear phase modes
+- Graphic EQ 15-band, 31-band, and Variable point editing with copy/paste rules across modes and layers
+- Parametric EQ with an unrestricted scrollable filter list
+- AutoEQ generation from Target and RAW references with corrected-measurement tracking
+- Advanced Crossfeed window with Natural and BS2B/RME-style algorithms
+- global Dry/Wet, Crossfeed, Balance, Input Gain, Output Gain, Global Gain, Auto Gain, Limiter, and Bypass
+- dynamic IN, PRE, and OUT meter display with live peak/RMS readouts and Auto Gain compensation status
+- project presets with embedded curve data, CalCurve preset migration, and ready-to-copy VST3 bundle output
+
 ## Supported Imports
 
 - WAV FIR impulse responses
@@ -50,6 +65,8 @@ When a text/APO curve declares a global `Preamp` or gain directive, FlexCurve se
 - Equalizer APO CSV correction curves
 - Melda FreeForm EQ CSV exports
 - Equalizer APO parametric EQ text
+- Stereo frequency/dB text rows in `frequency left_dB right_dB` form
+- Separate `Preamp L` / `Preamp R` or `Left Gain` / `Right Gain` directives
 
 ## Layers And Blend
 
@@ -74,11 +91,26 @@ The graph legend also selects layers. The active-layer text is informational and
 
 The white **Average** curve is read-only and derived live from audible source layers. It is the result used by preview and **Render FIR**.
 
+### Stereo L/R Layers
+
+Every layer contains independent Left and Right correction state, including source geometry, gain, Blend, 15/31/Variable Graphic EQ, Parametric EQ, smoothing, inversion, normalization, and AutoEQ reference state.
+
+- New mono curves start **Linked L+R**.
+- Choose **L**, **R**, or **L+R** from a layer row or the persistent rack.
+- Editing only L or R automatically splits a linked layer and preserves the untouched side.
+- L+R applies the next edit to both channels, but does not silently relink channels that were already split.
+- **Link** is explicit and copies the currently selected side to both channels.
+- Clicking an `[L]` or `[R]` graph legend selects that channel directly.
+- Split channels use darker/lighter variants of the layer color and produce independent Average, Tracking, preview, render, preset, and export data.
+
+Stereo WAV FIRs are analysed per channel. Mono WAV FIRs and mono TXT/CSV curves are duplicated safely to L+R. The default AutoEQ preamp is shared between L and R using the larger correction peak, preserving stereo balance. **Independent L/R AutoEQ Preamp** is available as an advanced option and may intentionally change channel balance.
+
 ### Blend Modes
 
 - **Per Layer** applies Bass, Mid, Treble, and crossover settings only to the active EQ layer.
 - **Global (Average)** keeps a separate set of regional Blend values and applies them consistently across all EQ layers, so the Average follows their visible result.
 - Layer Gain always remains an independent per-layer control.
+- Layer Balance applies a differential L/R dB offset to an EQ layer. Negative values shift that layer's correction left; positive values shift it right. The change is audible, visible, rendered, exported, and saved in presets.
 - **Invert** reverses the active layer correction around 0 dB.
 - **Reset Layer** clears the active layer's Blend and gain edits.
 - **Reset to Flat Curves** clears correction edits across every layer.
@@ -117,6 +149,7 @@ EQ clipboard compatibility is deliberate:
 - 31-band can paste exactly into 31-band or Variable, but not into 15-band.
 - Variable can paste exactly into Variable only.
 - These rules apply within the same layer and between different layers.
+- Paste is blocked only when source layer and source channel are both identical to the destination; copying L to R in the same layer is allowed.
 - Paste Inverted EQ follows the same rules and reverses the copied gains.
 
 ## Target, RAW, And AutoEQ
@@ -159,15 +192,16 @@ Each filter has enable, type, frequency, gain, Q, reset, and delete controls. Th
 ## Global Controls
 
 - **Dry/Wet** blends latency-aligned dry audio with correction. Audible EQ and Average curves flatten toward 0 dB as the control moves toward Dry; RAW, Target, and Tracking references remain in their analysis frame.
-- **Crossfeed** reduces hard left/right separation for headphone listening.
+- **Crossfeed** reduces hard left/right separation for headphone listening. **Advanced** selects the crossfeed topology: Natural uses geometry-based delay/head-shadow style crossfeed; BS2B/RME style uses filtered crossfeed. Geometry presets adjust head dimensions, speaker angle, cutoff, and direct level.
+- **Balance** is a final stereo balance trim. Negative values shift the corrected output left, positive values shift it right, and the audible EQ/Average curves show the same L/R offset.
 - **Gain** is a bipolar final output trim and moves audible EQ and Average curves without rewriting or repositioning RAW, Target, or Tracking references.
 - **Input Gain** is applied before correction and before Input metering.
 - **Output Gain** is applied after correction/Auto Gain and before Global Gain.
 - **Auto Gain** is an output-only trim for honest level-matched A/B monitoring. It applies gain only: no compression, transient shaping, or FIR modification.
 - **Match Output to Input** follows the RMS difference between corrected and input audio. It may boost or cut, but every block constrains positive compensation to its currently available peak headroom so learned gain cannot clip OUT after a layer or curve change.
-- **Downward Match** never boosts. It remembers the greatest peak reduction required and ratchets downward until Auto Gain is reset, disabled, or its mode changes.
-- **Meters** show IN, PRE, and OUT RMS/Peak. PRE is measured after correction and manual output stages but before Auto Gain, so correction-induced clipping remains visible even if the final output is attenuated safely.
-- **Reset Meters** clears held meter and clipping indications without changing the currently learned Auto Gain trim.
+- **Downward Match** never boosts. It remembers the greatest peak reduction required and ratchets downward until Auto Gain is disabled, its mode changes, or the project state resets it.
+- **Meters** show live IN, PRE, and OUT RMS/Peak. PRE is measured after correction and manual output stages but before Auto Gain, so correction-induced clipping remains visible even if the final output is attenuated safely.
+- Meter bars, top peak numbers, and lower IN/AUTO/OUT readouts are dynamic. They do not latch held clip states; red/orange status follows the current audio block and Auto Gain amount.
 - **Phase Mode** remains locked to Minimum during live preview and unlocks after FIR rendering.
 - **Limiter** is optional and only reduces peaks exceeding 0 dBFS.
 - **Bypass** passes the input and flattens audible EQ and Average curves. RAW and Target remain visible, while Tracking returns to the stored RAW response.
@@ -198,7 +232,7 @@ Phase engines:
 
 Tap counts and latency scale from a 44.1 kHz reference. FlexCurve rebuilds responses for the current host rate, including 44.1, 48, 88.2, 96, 176.4, and 192 kHz.
 
-The global **Export FIR** button writes the current rendered FIR as a mono 32-bit floating-point WAV and remains disabled while the project is in Preview or FIR Outdated state. The Blend rack can separately export each layer or Average as FIR WAV, frequency/dB TXT or CSV, GraphicEQ/APO text, Melda CSV, or APO parametric text where applicable.
+The global **Export FIR** button writes the current rendered FIR as a 32-bit floating-point WAV and remains disabled while the project is in Preview or FIR Outdated state. Linked/identical channels export as mono for compatibility; independent channels export as a true stereo FIR with L and R kernels. The Blend rack can separately export each layer or Average as FIR WAV, frequency/dB TXT or CSV, GraphicEQ/APO text, Melda CSV, or APO parametric text where applicable. Text formats that cannot represent two channels in one file produce clearly suffixed `_L` and `_R` files.
 
 Layer export preserves gain exactly once: GraphicEQ/APO formats write it as `Preamp`, FlexCurve FIR WAV files write it as metadata, and formats without a separate gain field bake it into the exported frequency/dB values. EQ layer gain affects audio and FIR rendering; Target and RAW gain acts only as a visual and AutoEQ reference offset.
 
@@ -220,6 +254,7 @@ A preset embeds:
 - global controls and phase mode
 - Input/Output Gain, Auto Gain, loudness-match mode, and FIR-export gain options
 - Target/RAW normalization offsets and per-layer source smoothing
+- L/R channel selection, link state, and complete independent edits for both channels
 - rendered state when available
 
 Because curves are embedded as frequency/dB data, presets remain usable if the original imported files are moved or removed. FlexCurve can also discover compatible `.calcurvepreset` and XML state files for migration from CalCurve.
@@ -235,6 +270,63 @@ Because curves are embedded as frequency/dB data, presets remain usable if the o
 - Git
 
 JUCE is vendored in `third_party/JUCE`, so a separate JUCE installation is not required.
+
+### One-Command Build
+
+From a generic checkout such as `C:\Projects\FlexCurve`, run:
+
+```powershell
+cd C:\Projects\FlexCurve
+.\build_flexcurve.bat
+```
+
+The root script is a convenience wrapper around the repository-style script in `scripts/`:
+
+```powershell
+.\scripts\build-flexcurve-vst3.bat
+```
+
+PowerShell can also run the script directly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-flexcurve-vst3.ps1
+```
+
+The script:
+
+1. finds Visual Studio 2022's `VsDevCmd.bat`
+2. configures CMake into `_build_verify`
+3. builds `FlexCurve_VST3`, `FlexCurveEngineTest`, and `FlexCurveVST3SmokeTest`
+4. runs the VST3 editor smoke test
+5. runs the preset roundtrip smoke test
+6. copies the verified VST3 bundle into `FlexCurve_VST3/FlexCurve.vst3`
+
+To include the full DSP engine test, pass a real local correction file:
+
+```powershell
+.\scripts\build-flexcurve-vst3.bat -TestCurve C:\Audio\TestCurves\headphone-correction.txt
+```
+
+Useful options:
+
+```powershell
+.\scripts\build-flexcurve-vst3.bat -SkipTests
+.\scripts\build-flexcurve-vst3.bat -NoBundleCopy
+.\scripts\build-flexcurve-vst3.bat -BuildDir build
+.\scripts\build-flexcurve-vst3.bat -JuceDir C:\Libraries\JUCE
+```
+
+The script can be launched from any current directory. It resolves the project root from its own location, checks for local `third_party/JUCE`, then configures and builds from that root. External requirements are Visual Studio 2022 C++ tools and CMake.
+
+The ready-to-copy release bundle is written to:
+
+```text
+FlexCurve_VST3/FlexCurve.vst3
+```
+
+Copy the complete `.vst3` folder to the system VST3 folder only after tests pass.
+
+### Manual Build
 
 Open **x64 Native Tools Command Prompt for VS 2022** or a Developer PowerShell where `cl.exe` is available.
 
@@ -334,6 +426,8 @@ Source/             FlexCurve processor, editor, and FIR engine
 tools/              Engine and VST3 smoke tests
 third_party/JUCE/   Vendored JUCE dependency
 FlexCurve_VST3/     Ready-to-copy VST3 bundle
+build_flexcurve.*   End-to-end build and smoke-test scripts
+scripts/            Repository-style build scripts
 ```
 
 ## Credits

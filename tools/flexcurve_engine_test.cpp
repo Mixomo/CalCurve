@@ -55,6 +55,37 @@ namespace
         return std::sqrt (outputEnergy / juce::jmax (1.0, inputEnergy));
     }
 
+    std::pair<double, double> processIdenticalStereoNoise (FlexCurveAudioProcessor& processor, int blocks)
+    {
+        juce::Random random (0x71e2);
+        juce::AudioBuffer<float> buffer (2, 512);
+        juce::MidiBuffer midi;
+        double leftEnergy = 0.0;
+        double rightEnergy = 0.0;
+
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+            {
+                const auto value = 0.05f * (random.nextFloat() * 2.0f - 1.0f);
+                buffer.setSample (0, sample, value);
+                buffer.setSample (1, sample, value);
+            }
+            processor.processBlock (buffer, midi);
+            if (! bufferIsFinite (buffer))
+                return { -1.0, -1.0 };
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+            {
+                const auto left = buffer.getSample (0, sample);
+                const auto right = buffer.getSample (1, sample);
+                leftEnergy += static_cast<double> (left) * left;
+                rightEnergy += static_cast<double> (right) * right;
+            }
+        }
+
+        return { leftEnergy, rightEnergy };
+    }
+
     float processTonePeak (FlexCurveAudioProcessor& processor, float amplitude, int blocks)
     {
         juce::AudioBuffer<float> buffer (2, 512);
@@ -115,9 +146,22 @@ int main (int argc, char* argv[])
     }
 
     const auto gainCurveFile = tempDirectory.getChildFile ("explicit_gain.txt");
+    const auto stereoCurveFile = tempDirectory.getChildFile ("stereo_curve.txt");
+    const auto stereoRawFile = tempDirectory.getChildFile ("stereo_raw.txt");
+    const auto stereoTargetFile = tempDirectory.getChildFile ("stereo_target.txt");
     if (! gainCurveFile.replaceWithText (
             "Preamp: -6.0 dB\n"
-            "GraphicEQ: 20 1.0; 1000 2.0; 20000 3.0\n"))
+            "GraphicEQ: 20 1.0; 1000 2.0; 20000 3.0\n")
+        || ! stereoCurveFile.replaceWithText (
+            "Preamp L: -3.0 dB\n"
+            "Preamp R: -6.0 dB\n"
+            "20 0.0 0.0\n"
+            "1000 2.0 -4.0\n"
+            "20000 0.0 0.0\n")
+        || ! stereoRawFile.replaceWithText (
+            "20 0.0 0.0\n1000 0.0 0.0\n20000 0.0 0.0\n")
+        || ! stereoTargetFile.replaceWithText (
+            "20 6.0 3.0\n1000 6.0 3.0\n20000 6.0 3.0\n"))
     {
         std::cout << "Could not create explicit gain curve\n";
         return 33;
@@ -139,6 +183,141 @@ int main (int argc, char* argv[])
     {
         std::cout << "Text parser did not separate Preamp from curve geometry\n";
         return 34;
+    }
+
+    const auto parsedStereoCurve = CurveFIR::parseCurveFileWithGain (stereoCurveFile);
+    if (! parsedStereoCurve.hasIndependentRightChannel
+        || ! parsedStereoCurve.hasExplicitGain || ! parsedStereoCurve.hasExplicitRightGain
+        || std::abs (parsedStereoCurve.gainDb + 3.0) > 0.001
+        || std::abs (parsedStereoCurve.rightGainDb + 6.0) > 0.001
+        || std::abs (CurveFIR::interpolateDb (parsedStereoCurve.points, 1000.0) - 2.0) > 0.001
+        || std::abs (CurveFIR::interpolateDb (parsedStereoCurve.rightPoints, 1000.0) + 4.0) > 0.001)
+    {
+        std::cout << "Stereo text parser did not preserve independent L/R geometry and gain\n";
+        return 101;
+    }
+
+    FlexCurveAudioProcessor stereoProcessor;
+    stereoProcessor.prepareToPlay (48000.0, 512);
+    if (! stereoProcessor.addFlatCurve())
+        return 102;
+    const auto stereoLayerId = stereoProcessor.getLayers().front().id;
+    if (! stereoProcessor.areLayerChannelsLinked (stereoLayerId)
+        || stereoProcessor.getLayerChannelSelection (stereoLayerId) != FlexChannelSelection::stereo)
+    {
+        std::cout << "New flat layer was not linked L+R by default\n";
+        return 103;
+    }
+
+    stereoProcessor.setLayerChannelSelection (stereoLayerId, FlexChannelSelection::left);
+    stereoProcessor.setLayerGain (stereoLayerId, 6.0f);
+    if (stereoProcessor.areLayerChannelsLinked (stereoLayerId)
+        || std::abs (CurveFIR::interpolateDb (
+                         stereoProcessor.getLayerCurve (stereoLayerId, FlexChannelSelection::left), 1000.0) - 6.0) > 0.05
+        || std::abs (CurveFIR::interpolateDb (
+                         stereoProcessor.getLayerCurve (stereoLayerId, FlexChannelSelection::right), 1000.0)) > 0.05)
+    {
+        std::cout << "Left-only edit did not split the linked layer correctly\n";
+        return 104;
+    }
+
+    stereoProcessor.setLayerChannelSelection (stereoLayerId, FlexChannelSelection::stereo);
+    stereoProcessor.setLayerGain (stereoLayerId, 3.0f);
+    const auto stereoLeftDb = CurveFIR::interpolateDb (
+        stereoProcessor.getLayerCurve (stereoLayerId, FlexChannelSelection::left), 1000.0);
+    const auto stereoRightDb = CurveFIR::interpolateDb (
+        stereoProcessor.getLayerCurve (stereoLayerId, FlexChannelSelection::right), 1000.0);
+    if (stereoProcessor.areLayerChannelsLinked (stereoLayerId)
+        || std::abs (stereoLeftDb - 3.0) > 0.05 || std::abs (stereoRightDb - 3.0) > 0.05)
+    {
+        std::cout << "L+R edit relinked split channels or failed to update both\n";
+        return 105;
+    }
+
+    stereoProcessor.setLayerChannelSelection (stereoLayerId, FlexChannelSelection::left);
+    stereoProcessor.setLayerGain (stereoLayerId, 9.0f);
+    stereoProcessor.linkLayerChannels (stereoLayerId);
+    if (! stereoProcessor.areLayerChannelsLinked (stereoLayerId)
+        || stereoProcessor.getLayerChannelSelection (stereoLayerId) != FlexChannelSelection::stereo
+        || std::abs (CurveFIR::interpolateDb (
+                         stereoProcessor.getLayerCurve (stereoLayerId, FlexChannelSelection::right), 1000.0) - 9.0) > 0.05)
+    {
+        std::cout << "Explicit Link did not copy the selected channel to both sides\n";
+        return 106;
+    }
+
+    stereoProcessor.setLayerChannelSelection (stereoLayerId, FlexChannelSelection::right);
+    stereoProcessor.setLayerGain (stereoLayerId, -9.0f);
+    juce::MemoryBlock stereoState;
+    stereoProcessor.getStateInformation (stereoState);
+    FlexCurveAudioProcessor restoredStereoProcessor;
+    restoredStereoProcessor.prepareToPlay (48000.0, 512);
+    restoredStereoProcessor.setStateInformation (
+        stereoState.getData(), static_cast<int> (stereoState.getSize()));
+    if (restoredStereoProcessor.areLayerChannelsLinked (stereoLayerId)
+        || restoredStereoProcessor.getLayerChannelSelection (stereoLayerId) != FlexChannelSelection::right
+        || std::abs (CurveFIR::interpolateDb (
+                         restoredStereoProcessor.getLayerCurve (
+                             stereoLayerId, FlexChannelSelection::left), 1000.0) - 9.0) > 0.05
+        || std::abs (CurveFIR::interpolateDb (
+                         restoredStereoProcessor.getLayerCurve (
+                             stereoLayerId, FlexChannelSelection::right), 1000.0) + 9.0) > 0.05)
+    {
+        std::cout << "Stereo layer state did not survive preset roundtrip\n";
+        return 107;
+    }
+
+    setParameterValue (restoredStereoProcessor, "autogain", 0.0f);
+    setParameterValue (restoredStereoProcessor, "crossfeed", 0.0f);
+    pumpMessageLoop (250);
+    const auto stereoEnergy = processIdenticalStereoNoise (restoredStereoProcessor, 300);
+    if (stereoEnergy.first <= 0.0 || stereoEnergy.second <= 0.0
+        || stereoEnergy.first < stereoEnergy.second * 20.0)
+    {
+        std::cout << "Independent L/R preview did not produce distinct channel levels\n";
+        return 108;
+    }
+
+    restoredStereoProcessor.renderFir();
+    const auto stereoFirFile = tempDirectory.getChildFile ("stereo_render.wav");
+    if (! restoredStereoProcessor.exportCurrentFirToFile (stereoFirFile))
+        return 109;
+    juce::AudioFormatManager stereoFormatManager;
+    stereoFormatManager.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> stereoReader (
+        stereoFormatManager.createReaderFor (stereoFirFile));
+    if (stereoReader == nullptr || stereoReader->numChannels != 2)
+    {
+        std::cout << "Independent L/R render was not exported as a stereo FIR WAV\n";
+        return 110;
+    }
+
+    FlexCurveAudioProcessor stereoAutoEqProcessor;
+    stereoAutoEqProcessor.prepareToPlay (48000.0, 512);
+    if (! stereoAutoEqProcessor.addReferenceCurveFile (
+            stereoRawFile, FlexCurveLayerType::raw)
+        || ! stereoAutoEqProcessor.addReferenceCurveFile (
+            stereoTargetFile, FlexCurveLayerType::target))
+        return 111;
+    const auto stereoReferences = stereoAutoEqProcessor.getLayers();
+    const auto stereoRawId = stereoReferences[0].type == FlexCurveLayerType::raw
+        ? stereoReferences[0].id : stereoReferences[1].id;
+    const auto stereoTargetId = stereoReferences[0].type == FlexCurveLayerType::target
+        ? stereoReferences[0].id : stereoReferences[1].id;
+    stereoAutoEqProcessor.setActiveLayerId (stereoRawId);
+    stereoAutoEqProcessor.setLayerChannelSelection (
+        stereoRawId, FlexChannelSelection::stereo);
+    if (! stereoAutoEqProcessor.generateAutoEq (
+            stereoRawId, stereoTargetId, FlexCurveAudioProcessor::AutoEqMode::variable))
+        return 112;
+    const auto stereoAutoEqLayers = stereoAutoEqProcessor.getLayers();
+    const auto& stereoAutoEq = stereoAutoEqLayers.back();
+    if (stereoAutoEq.channelsLinked
+        || std::abs (stereoAutoEq.gainDb - stereoAutoEq.right.gainDb) > 0.01f
+        || std::abs (stereoAutoEq.gainDb + 6.0f) > 0.25f)
+    {
+        std::cout << "Stereo AutoEQ did not use a shared safe L/R preamp\n";
+        return 113;
     }
     const auto parsedGlobalGain = CurveFIR::parseCurveTextWithGain (
         "Global Gain: 2.5 dB\n20 0\n20000 0\n");
@@ -349,11 +528,13 @@ int main (int argc, char* argv[])
     positiveAutoGainHeadroomProcessor.setLayerGain (positiveHeadroomLayerId, -12.0f);
     setParameterValue (positiveAutoGainHeadroomProcessor, "autogain", 1.0f);
     setParameterValue (positiveAutoGainHeadroomProcessor, "loudnessmatchmode", 0.0f);
-    pumpMessageLoop (100);
+    positiveAutoGainHeadroomProcessor.renderFir();
     processTonePeak (positiveAutoGainHeadroomProcessor, 0.05f, 500);
-    if (positiveAutoGainHeadroomProcessor.getMeterSnapshot().autoGainDb < 8.0f)
+    const auto learnedPositiveGain = positiveAutoGainHeadroomProcessor.getMeterSnapshot().autoGainDb;
+    if (learnedPositiveGain < 8.0f)
     {
-        std::cout << "Positive Auto Gain headroom fixture did not learn a boost\n";
+        std::cout << "Positive Auto Gain headroom fixture did not learn a boost: "
+                  << learnedPositiveGain << " dB\n";
         return 76;
     }
     setParameterValue (positiveAutoGainHeadroomProcessor, "outputgain", 12.0f);
@@ -612,7 +793,14 @@ int main (int argc, char* argv[])
     if (normalizedRaw == normalizedLayers.end() || ! normalizedRaw->smoothSourceCurve
         || std::abs (normalizedRaw->normalizationOffsetDb) < 0.01f)
     {
-        std::cout << "Reference normalization/smoothing did not survive state roundtrip\n";
+        std::cout << "Reference normalization/smoothing did not survive state roundtrip"
+                  << " found=" << (normalizedRaw != normalizedLayers.end());
+        if (normalizedRaw != normalizedLayers.end())
+            std::cout << " smooth=" << normalizedRaw->smoothSourceCurve
+                      << " norm=" << normalizedRaw->normalizationOffsetDb
+                      << " rightSmooth=" << normalizedRaw->right.smoothSourceCurve
+                      << " rightNorm=" << normalizedRaw->right.normalizationOffsetDb;
+        std::cout << "\n";
         return 45;
     }
 
@@ -876,13 +1064,28 @@ int main (int argc, char* argv[])
         return 14;
     }
     processor.setPreserveVariableShapeAcrossModes (false);
+    processor.setLayerChannelSelection (layerId, FlexChannelSelection::left);
     processor.setGraphicMode (0);
     processor.copyCurrentGraphicEq();
-    if (! processor.canPasteCurrentGraphicEq())
+    if (processor.canPasteCurrentGraphicEq())
     {
-        std::cout << "Variable EQ could not paste within its source layer\n";
+        std::cout << "Variable EQ was allowed to paste into its exact source layer/channel\n";
         return 15;
     }
+    processor.setLayerChannelSelection (layerId, FlexChannelSelection::right);
+    processor.setGraphicMode (0);
+    if (! processor.canPasteCurrentGraphicEq())
+    {
+        std::cout << "Variable EQ could not paste from L to R in the same layer\n";
+        return 114;
+    }
+    processor.pasteCurrentGraphicEq();
+    if (processor.getFreeformPoints().empty())
+    {
+        std::cout << "L-to-R Variable paste did not copy EQ data\n";
+        return 115;
+    }
+    processor.setLayerChannelSelection (layerId, FlexChannelSelection::left);
     if (! processor.addFlatCurve())
         return 16;
     const auto secondLayerId = processor.getLayers().back().id;
@@ -964,11 +1167,18 @@ int main (int argc, char* argv[])
         return 98;
     }
 
+    processor.setLayerChannelSelection (secondLayerId, FlexChannelSelection::left);
     processor.copyCurrentParametricEq();
+    if (processor.canPasteCurrentParametricEq())
+    {
+        std::cout << "Parametric EQ was allowed to paste into its exact source layer/channel\n";
+        return 99;
+    }
+    processor.setLayerChannelSelection (secondLayerId, FlexChannelSelection::right);
     if (! processor.canPasteCurrentParametricEq())
     {
-        std::cout << "Parametric EQ could not paste within the same layer\n";
-        return 99;
+        std::cout << "Parametric EQ could not paste from L to R in the same layer\n";
+        return 116;
     }
     processor.pasteCurrentParametricEq();
     processor.removeLayer (secondLayerId);
@@ -1031,13 +1241,20 @@ int main (int argc, char* argv[])
 
     const auto exportFile = juce::File::getSpecialLocation (juce::File::tempDirectory)
                                 .getChildFile ("flexcurve_average_test.txt");
-    if (! processor.exportLayerToFile (-1, true, FlexCurveAudioProcessor::CurveExportFormat::apoParametric, exportFile)
-        || ! exportFile.loadFileAsString().containsIgnoreCase ("Filter: ON"))
+    const auto exportLeftFile = exportFile.getSiblingFile ("flexcurve_average_test_L.txt");
+    const auto exportRightFile = exportFile.getSiblingFile ("flexcurve_average_test_R.txt");
+    const auto averageExported = processor.exportLayerToFile (
+        -1, true, FlexCurveAudioProcessor::CurveExportFormat::apoParametric, exportFile);
+    const auto exportText = exportFile.existsAsFile()
+        ? exportFile.loadFileAsString() : exportLeftFile.loadFileAsString();
+    if (! averageExported || ! exportText.containsIgnoreCase ("Filter: ON"))
     {
         std::cout << "Average APO Parametric export failed\n";
         return 20;
     }
     exportFile.deleteFile();
+    exportLeftFile.deleteFile();
+    exportRightFile.deleteFile();
 
     processor.setActiveLayerId (layerId);
     processor.setGraphicSmoothing (true);
@@ -1164,6 +1381,7 @@ int main (int argc, char* argv[])
     }
 
     processor.releaseResources();
+    pumpMessageLoop (50);
     std::cout << "FlexCurve engine test OK\n";
     return 0;
 }

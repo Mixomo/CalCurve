@@ -293,7 +293,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout FlexCurveAudioProcessor::cre
     params.push_back (std::make_unique<juce::AudioParameterBool> ("autogain", "Auto Gain", true));
     params.push_back (std::make_unique<juce::AudioParameterChoice> (
         "loudnessmatchmode", "Loudness Match Mode",
-        juce::StringArray { "Output to Input", "Downward Match" }, 0));
+        juce::StringArray { "Match OUT to IN", "Match IN to OUT" }, 0));
     params.push_back (std::make_unique<juce::AudioParameterBool> (
         "includeoutputgainfir", "Include Output Gain in FIR Export", false));
     params.push_back (std::make_unique<juce::AudioParameterBool> (
@@ -426,7 +426,8 @@ void FlexCurveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
         return;
     }
 
-    const bool useFir = hasRenderedFir.load() && ! firOutdated.load() && dryWet > 0.0f;
+    const bool useAshPreview = ashPreviewActive.load();
+    const bool useFir = ! useAshPreview && hasRenderedFir.load() && ! firOutdated.load() && dryWet > 0.0f;
 
     if (useFir)
     {
@@ -514,13 +515,8 @@ void FlexCurveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     preAutoClip.store (preAutoPeak > 1.0f);
     preAutoClipOverDb.store (preAutoPeak > 1.0f ? juce::Decibels::gainToDecibels (preAutoPeak, 0.0f) : 0.0f);
 
-    updateRuntimeAutoGain (static_cast<float> (inputStats.meanSquare),
-                           static_cast<float> (preAutoStats.meanSquare),
-                           preAutoStats.peak,
-                           downstreamGain,
-                           buffer.getNumSamples());
     if (autoGainEnabled)
-        buffer.applyGain (juce::Decibels::decibelsToGain (smoothedRuntimeAutoGainDb.load()));
+        buffer.applyGain (juce::Decibels::decibelsToGain (runtimeAutoGainDb.load()));
 
     buffer.applyGain (downstreamGain);
 
@@ -735,6 +731,34 @@ bool FlexCurveAudioProcessor::addCurveFile (const juce::File& file)
         layers.push_back (std::move (layer));
         if (activeLayerId == 0)
             activeLayerId = layers.back().id;
+        finalCurve = calculateFinalCurveLocked();
+    }
+
+    markPreviewDirty();
+    return true;
+}
+
+bool FlexCurveAudioProcessor::addCurvePoints (const juce::String& name, std::vector<CurvePoint> points)
+{
+    if (editsBlocked() || ! canAddUserLayer() || points.empty())
+        return false;
+
+    recordUndoState ("add-curve-points");
+    {
+        const juce::ScopedLock lock (projectLock);
+        FlexCurveLayer layer;
+        layer.id = nextLayerId++;
+        layer.type = FlexCurveLayerType::eq;
+        layer.name = name.isNotEmpty() ? name : "ASH Curve";
+        layer.points = std::move (points);
+        layer.colour = nextLayerColour (layers);
+        layer.paramBands.resize (8);
+        copyLeftChannelToRight (layer);
+        layers.push_back (std::move (layer));
+        activeLayerId = layers.back().id;
+        ashPreviewCurve.clear();
+        ashPreviewLabel.clear();
+        ashPreviewActive.store (false);
         finalCurve = calculateFinalCurveLocked();
     }
 
@@ -1304,6 +1328,15 @@ void FlexCurveAudioProcessor::resetAll()
         layers.clear();
         finalCurve.clear();
         finalCurveRight.clear();
+        ashPreviewCurve.clear();
+        ashPreviewLabel.clear();
+        ashCatalogSearch.clear();
+        ashCatalogReviewer.clear();
+        ashCatalogMeasurement.clear();
+        ashCatalogBrand.clear();
+        ashCatalogModel.clear();
+        ashCatalogSelectedLabel.clear();
+        ashPreviewActive.store (false);
         renderedCurve.clear();
         renderedCurveRight.clear();
         nextLayerId = 1;
@@ -1424,6 +1457,69 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::getFinalCurve() const
 {
     const juce::ScopedLock lock (projectLock);
     return finalCurve;
+}
+
+std::vector<CurvePoint> FlexCurveAudioProcessor::getAshPreviewCurve() const
+{
+    const juce::ScopedLock lock (projectLock);
+    return ashPreviewCurve;
+}
+
+juce::String FlexCurveAudioProcessor::getAshPreviewLabel() const
+{
+    const juce::ScopedLock lock (projectLock);
+    return ashPreviewLabel;
+}
+
+void FlexCurveAudioProcessor::setAshPreviewCurve (const juce::String& label, std::vector<CurvePoint> points)
+{
+    {
+        const juce::ScopedLock lock (projectLock);
+        ashPreviewLabel = label;
+        ashPreviewCurve = std::move (points);
+    }
+    ashPreviewActive.store (true);
+    updateFixedAutoGainFromCurrentCurve();
+    previewFiltersDirty.store (true);
+    if (! restoringState.load())
+        triggerAsyncUpdate();
+}
+
+void FlexCurveAudioProcessor::clearAshPreviewCurve()
+{
+    {
+        const juce::ScopedLock lock (projectLock);
+        ashPreviewLabel.clear();
+        ashPreviewCurve.clear();
+    }
+    ashPreviewActive.store (false);
+    updateFixedAutoGainFromCurrentCurve();
+    previewFiltersDirty.store (true);
+    if (! restoringState.load())
+        triggerAsyncUpdate();
+}
+
+void FlexCurveAudioProcessor::setAshCatalogBrowserState (const juce::String& search,
+                                                          const juce::String& reviewer,
+                                                          const juce::String& measurement,
+                                                          const juce::String& brand,
+                                                          const juce::String& model,
+                                                          const juce::String& selectedLabel)
+{
+    const juce::ScopedLock lock (projectLock);
+    ashCatalogSearch = search;
+    ashCatalogReviewer = reviewer;
+    ashCatalogMeasurement = measurement;
+    ashCatalogBrand = brand;
+    ashCatalogModel = model;
+    ashCatalogSelectedLabel = selectedLabel;
+}
+
+juce::StringArray FlexCurveAudioProcessor::getAshCatalogBrowserState() const
+{
+    const juce::ScopedLock lock (projectLock);
+    return { ashCatalogSearch, ashCatalogReviewer, ashCatalogMeasurement,
+             ashCatalogBrand, ashCatalogModel, ashCatalogSelectedLabel };
 }
 
 std::vector<CurvePoint> FlexCurveAudioProcessor::getRenderedCurve() const
@@ -2369,6 +2465,7 @@ void FlexCurveAudioProcessor::markPreviewDirty()
         finalCurve = calculateAverageCurveLocked (FlexChannelSelection::left);
         finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
     }
+    updateFixedAutoGainFromCurrentCurve();
     previewFiltersDirty = true;
     if (restoringState.load())
         return;
@@ -2531,6 +2628,13 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveLocked (
     return points;
 }
 
+std::vector<CurvePoint> FlexCurveAudioProcessor::calculatePreviewCurveLocked (
+    FlexChannelSelection channel) const
+{
+    juce::ignoreUnused (channel);
+    return ashPreviewCurve.empty() ? calculateAverageCurveLocked (channel) : ashPreviewCurve;
+}
+
 std::vector<CurvePoint> FlexCurveAudioProcessor::calculateAverageCurveForTypeLocked (
     FlexCurveLayerType type, bool applyReferenceDisplayOffset, FlexChannelSelection channel) const
 {
@@ -2586,9 +2690,12 @@ std::vector<CurvePoint> FlexCurveAudioProcessor::calculateFinalCurveLocked() con
 
 void FlexCurveAudioProcessor::updateFinalCurve()
 {
-    const juce::ScopedLock lock (projectLock);
-    finalCurve = calculateFinalCurveLocked();
-    finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
+    {
+        const juce::ScopedLock lock (projectLock);
+        finalCurve = calculateFinalCurveLocked();
+        finalCurveRight = calculateAverageCurveLocked (FlexChannelSelection::right);
+    }
+    updateFixedAutoGainFromCurrentCurve();
 }
 
 void FlexCurveAudioProcessor::renderFir()
@@ -2668,6 +2775,7 @@ void FlexCurveAudioProcessor::renderFir()
     hasRenderedFir = true;
     firOutdated = false;
     editLocked = true;
+    updateFixedAutoGainFromCurrentCurve();
 }
 
 bool FlexCurveAudioProcessor::exportCurrentFirToFile (const juce::File& file)
@@ -2690,7 +2798,7 @@ bool FlexCurveAudioProcessor::exportCurrentFirToFile (const juce::File& file)
     if (parameters.getRawParameterValue ("includeoutputgainfir")->load() > 0.5f)
         exportedGainDb += parameters.getRawParameterValue ("outputgain")->load();
     if (parameters.getRawParameterValue ("includeautogainfir")->load() > 0.5f)
-        exportedGainDb += smoothedRuntimeAutoGainDb.load();
+        exportedGainDb += runtimeAutoGainDb.load();
     if (! juce::approximatelyEqual (exportedGainDb, 0.0))
     {
         for (auto& point : points)
@@ -3175,8 +3283,8 @@ bool FlexCurveAudioProcessor::exportLayerToFile (int layerId, bool average, Curv
         }
         if (parameters.getRawParameterValue ("includeautogainfir")->load() > 0.5f)
         {
-            separateGainDb += smoothedRuntimeAutoGainDb.load();
-            separateRightGainDb += smoothedRuntimeAutoGainDb.load();
+            separateGainDb += runtimeAutoGainDb.load();
+            separateRightGainDb += runtimeAutoGainDb.load();
         }
         auto firPoints = points;
         auto rightFirPoints = rightPoints;
@@ -3442,61 +3550,36 @@ void FlexCurveAudioProcessor::updateMeters (const juce::AudioBuffer<float>& buff
     }
 }
 
-void FlexCurveAudioProcessor::updateRuntimeAutoGain (float inputPower, float outputPower, float outputPeak,
-                                                     float downstreamGain, int numSamples)
+void FlexCurveAudioProcessor::updateFixedAutoGainFromCurrentCurve() noexcept
 {
-    if (autoGainResetRequested.exchange (false))
-        resetAutoGainState();
-
-    const auto enabled = parameters.getRawParameterValue ("autogain")->load() > 0.5f;
-    const auto mode = juce::roundToInt (parameters.getRawParameterValue ("loudnessmatchmode")->load());
-    const auto predictedPeak = outputPeak * downstreamGain;
-    const auto headroomLimitDb = predictedPeak > 1.0e-6f
-        ? juce::jlimit (-18.0f, 18.0f,
-                       juce::Decibels::gainToDecibels (0.999f / predictedPeak, -18.0f))
-        : 18.0f;
-    if (inputPower > 1.0e-10f && outputPower > 1.0e-10f)
+    float fixedDb = 0.0f;
+    try
     {
-        inputPowerIntegrator += static_cast<double> (inputPower) * numSamples;
-        outputPowerIntegrator += static_cast<double> (outputPower) * numSamples;
-        autoGainSampleCount += numSamples;
-    }
-
-    const auto updateSamples = static_cast<juce::int64> (juce::jmax (1.0, currentSampleRate * 0.40));
-    if (autoGainSampleCount >= updateSamples)
-    {
-        const auto ratio = std::sqrt (inputPowerIntegrator / juce::jmax (1.0e-20, outputPowerIntegrator));
-        auto targetDb = static_cast<float> (juce::jlimit (-18.0, 18.0,
-            juce::Decibels::gainToDecibels (ratio, -18.0)));
-
-        if (mode == 1)
+        std::vector<CurvePoint> points;
         {
-            targetDb = juce::jmin (0.0f, targetDb, headroomLimitDb);
-            runtimeAutoGainDb.store (juce::jmin (runtimeAutoGainDb.load(), targetDb));
+            const juce::ScopedLock lock (projectLock);
+            if (ashPreviewActive.load() && ! ashPreviewCurve.empty())
+                points = ashPreviewCurve;
+            else if (hasRenderedFir.load() && ! firOutdated.load() && ! renderedCurve.empty())
+                points = renderedCurve;
+            else
+                points = finalCurve;
         }
-        else
+
+        if (! points.empty())
         {
-            runtimeAutoGainDb.store (juce::jmin (targetDb, headroomLimitDb));
+            fixedDb = static_cast<float> (juce::jlimit (
+                -18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (points, currentSampleRate)));
+            if (juce::roundToInt (parameters.getRawParameterValue ("loudnessmatchmode")->load()) == 1)
+                fixedDb = -fixedDb;
         }
-        inputPowerIntegrator = 0.0;
-        outputPowerIntegrator = 0.0;
-        autoGainSampleCount = 0;
     }
-
-    auto smoothedDb = smoothedRuntimeAutoGainDb.load();
-    if (enabled && headroomLimitDb < smoothedDb)
+    catch (...)
     {
-        runtimeAutoGainDb.store (juce::jmin (runtimeAutoGainDb.load(), headroomLimitDb));
-        smoothedDb = headroomLimitDb;
+        fixedDb = 0.0f;
     }
 
-    const auto targetDb = enabled ? runtimeAutoGainDb.load() : 0.0f;
-    const auto movingDown = targetDb < smoothedDb;
-    const auto timeSeconds = movingDown ? 0.20 : (mode == 1 ? 30.0 : 1.25);
-    const auto smoothing = static_cast<float> (1.0 - std::exp (
-        -static_cast<double> (numSamples) / juce::jmax (1.0, currentSampleRate * timeSeconds)));
-    smoothedDb += (targetDb - smoothedDb) * smoothing;
-    smoothedRuntimeAutoGainDb.store (smoothedDb);
+    runtimeAutoGainDb.store (fixedDb);
 }
 
 FlexCurveAudioProcessor::MeterSnapshot FlexCurveAudioProcessor::getMeterSnapshot() const noexcept
@@ -3513,7 +3596,7 @@ FlexCurveAudioProcessor::MeterSnapshot FlexCurveAudioProcessor::getMeterSnapshot
     result.inputClipped = inputClip.load();
     result.preAutoClipped = preAutoClip.load();
     result.outputClipped = outputClip.load();
-    result.autoGainDb = smoothedRuntimeAutoGainDb.load();
+    result.autoGainDb = runtimeAutoGainDb.load();
     result.inputClipOverDb = inputClipOverDb.load();
     result.preAutoClipOverDb = preAutoClipOverDb.load();
     result.outputClipOverDb = outputClipOverDb.load();
@@ -3564,18 +3647,11 @@ void FlexCurveAudioProcessor::resetMeters() noexcept
     inputClipOverDb.store (0.0f);
     preAutoClipOverDb.store (0.0f);
     outputClipOverDb.store (0.0f);
-    inputPowerIntegrator = 0.0;
-    outputPowerIntegrator = 0.0;
-    autoGainSampleCount = 0;
 }
 
 void FlexCurveAudioProcessor::resetAutoGainState() noexcept
 {
-    runtimeAutoGainDb.store (0.0f);
-    smoothedRuntimeAutoGainDb.store (0.0f);
-    inputPowerIntegrator = 0.0;
-    outputPowerIntegrator = 0.0;
-    autoGainSampleCount = 0;
+    updateFixedAutoGainFromCurrentCurve();
 }
 
 void FlexCurveAudioProcessor::parameterChanged (const juce::String& parameterID, float)
@@ -3585,12 +3661,18 @@ void FlexCurveAudioProcessor::parameterChanged (const juce::String& parameterID,
 
     if (parameterID == "phasemode" && hasRenderedFir && ! firOutdated)
         triggerAsyncUpdate();
-    else if (parameterID == "autogain" || parameterID == "loudnessmatchmode")
-        autoGainResetRequested.store (true);
+    else if (parameterID == "loudnessmatchmode")
+        updateFixedAutoGainFromCurrentCurve();
 }
 
 void FlexCurveAudioProcessor::handleAsyncUpdate()
 {
+    if (ashPreviewActive.load() && previewFiltersDirty.load())
+    {
+        rebuildPreviewFilters();
+        return;
+    }
+
     if (hasRenderedFir && ! firOutdated)
     {
         rebuildConvolutionFromRenderedCurve();
@@ -3728,8 +3810,8 @@ void FlexCurveAudioProcessor::rebuildPreviewFilters()
     std::vector<CurvePoint> rightPoints;
     {
         const juce::ScopedLock lock (projectLock);
-        points = calculateAverageCurveLocked (FlexChannelSelection::left);
-        rightPoints = calculateAverageCurveLocked (FlexChannelSelection::right);
+        points = calculatePreviewCurveLocked (FlexChannelSelection::left);
+        rightPoints = calculatePreviewCurveLocked (FlexChannelSelection::right);
     }
     if (points.empty() || currentSampleRate <= 0.0)
     {
@@ -4342,6 +4424,7 @@ void FlexCurveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     auto state = parameters.copyState();
     for (const auto& childType : { juce::Identifier ("Layers"),
                                   juce::Identifier ("RenderedCurve"),
+                                  juce::Identifier ("AshPreview"),
                                   juce::Identifier ("Parametric"),
                                   juce::Identifier ("Freeform") })
     {
@@ -4377,7 +4460,26 @@ void FlexCurveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
         state.setProperty ("showCorrectedMeasurements", areCorrectedMeasurementsVisible(), nullptr);
         state.setProperty ("renderedSampleRate", currentSampleRate, nullptr);
         state.setProperty ("renderedPhaseMode", static_cast<int> (getPhaseMode()), nullptr);
-        state.setProperty ("runtimeAutoGainDb", runtimeAutoGainDb.load(), nullptr);
+        state.setProperty ("ashCatalogSearch", ashCatalogSearch, nullptr);
+        state.setProperty ("ashCatalogReviewer", ashCatalogReviewer, nullptr);
+        state.setProperty ("ashCatalogMeasurement", ashCatalogMeasurement, nullptr);
+        state.setProperty ("ashCatalogBrand", ashCatalogBrand, nullptr);
+        state.setProperty ("ashCatalogModel", ashCatalogModel, nullptr);
+        state.setProperty ("ashCatalogSelectedLabel", ashCatalogSelectedLabel, nullptr);
+        state.setProperty ("ashPreviewLabel", ashPreviewLabel, nullptr);
+        state.setProperty ("ashPreviewActive", ashPreviewActive.load(), nullptr);
+        if (! ashPreviewCurve.empty())
+        {
+            juce::ValueTree previewTree ("AshPreview");
+            for (const auto& point : ashPreviewCurve)
+            {
+                juce::ValueTree pointTree ("Point");
+                pointTree.setProperty ("f", point.frequency, nullptr);
+                pointTree.setProperty ("db", point.db, nullptr);
+                previewTree.addChild (pointTree, -1, nullptr);
+            }
+            state.addChild (previewTree, -1, nullptr);
+        }
     }
 
     addLayersToState (state);
@@ -4397,6 +4499,7 @@ void FlexCurveAudioProcessor::setStateInformation (const void* data, int sizeInB
     auto parameterState = state.createCopy();
     for (const auto& childType : { juce::Identifier ("Layers"),
                                   juce::Identifier ("RenderedCurve"),
+                                  juce::Identifier ("AshPreview"),
                                   juce::Identifier ("Parametric"),
                                   juce::Identifier ("Freeform") })
     {
@@ -4426,7 +4529,7 @@ void FlexCurveAudioProcessor::setStateInformation (const void* data, int sizeInB
         presetName = state.getProperty ("presetName", "Untitled").toString();
         globalDbRange.store (juce::jlimit (1.0f, 96.0f, static_cast<float> (state.getProperty ("globalDbRange", 12.0f))));
         editLocked = static_cast<bool> (state.getProperty ("editLocked", false));
-        lastOpenTabIndex = juce::jlimit (0, 2, static_cast<int> (state.getProperty ("lastOpenTabIndex", 0)));
+        lastOpenTabIndex = juce::jlimit (0, 3, static_cast<int> (state.getProperty ("lastOpenTabIndex", 0)));
         layerTypeVisible[static_cast<size_t> (FlexCurveLayerType::eq)]
             = static_cast<bool> (state.getProperty ("showEqLayers", true));
         layerTypeVisible[static_cast<size_t> (FlexCurveLayerType::target)]
@@ -4435,8 +4538,23 @@ void FlexCurveAudioProcessor::setStateInformation (const void* data, int sizeInB
             = static_cast<bool> (state.getProperty ("showRawLayers", true));
         correctedMeasurementsVisible
             = static_cast<bool> (state.getProperty ("showCorrectedMeasurements", true));
-        runtimeAutoGainDb.store (static_cast<float> (state.getProperty ("runtimeAutoGainDb", 0.0f)));
-        smoothedRuntimeAutoGainDb.store (runtimeAutoGainDb.load());
+        ashCatalogSearch = state.getProperty ("ashCatalogSearch").toString();
+        ashCatalogReviewer = state.getProperty ("ashCatalogReviewer").toString();
+        ashCatalogMeasurement = state.getProperty ("ashCatalogMeasurement").toString();
+        ashCatalogBrand = state.getProperty ("ashCatalogBrand").toString();
+        ashCatalogModel = state.getProperty ("ashCatalogModel").toString();
+        ashCatalogSelectedLabel = state.getProperty ("ashCatalogSelectedLabel").toString();
+        ashPreviewLabel = state.getProperty ("ashPreviewLabel").toString();
+        ashPreviewCurve.clear();
+        const auto ashPreviewTree = state.getChildWithName ("AshPreview");
+        for (int i = 0; i < ashPreviewTree.getNumChildren(); ++i)
+        {
+            const auto pointTree = ashPreviewTree.getChild (i);
+            ashPreviewCurve.push_back ({ static_cast<double> (pointTree.getProperty ("f", 0.0)),
+                                         static_cast<double> (pointTree.getProperty ("db", 0.0)) });
+        }
+        ashPreviewActive.store (static_cast<bool> (state.getProperty ("ashPreviewActive", false))
+                                && ! ashPreviewCurve.empty());
     }
 
     restoreLayersFromState (state);
@@ -4556,6 +4674,7 @@ void FlexCurveAudioProcessor::setStateInformation (const void* data, int sizeInB
         }
     }
 
+    updateFixedAutoGainFromCurrentCurve();
     restoringState = false;
     triggerAsyncUpdate();
 }

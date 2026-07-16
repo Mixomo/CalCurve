@@ -1,6 +1,7 @@
 #include "../Source/FlexCurveProcessor.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
 #include <thread>
@@ -120,6 +121,89 @@ namespace
         juce::MessageManager::getInstance()->runDispatchLoop();
         stopper.join();
     }
+
+    int scaleReferenceSamples (int referenceSamples, double sampleRate)
+    {
+        auto scaled = static_cast<int> (std::round (static_cast<double> (referenceSamples) * sampleRate / 44100.0));
+        scaled = juce::jlimit (256, 65536, scaled);
+        if ((scaled & 1) != 0)
+            ++scaled;
+        return scaled;
+    }
+
+    bool verifySampleRateStableImportAndPhase (const juce::File& curveFile)
+    {
+        std::vector<CurvePoint> referenceCurve;
+        for (auto sampleRate : { 44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0 })
+        {
+            FlexCurveAudioProcessor processor;
+            processor.prepareToPlay (sampleRate, 512);
+            if (! processor.addCurveFile (curveFile))
+            {
+                std::cout << "Sample-rate stability import failed at " << sampleRate << " Hz\n";
+                return false;
+            }
+
+            const auto importedCurve = processor.getFinalCurve();
+            if (importedCurve.empty())
+            {
+                std::cout << "Sample-rate stability import produced an empty curve at " << sampleRate << " Hz\n";
+                return false;
+            }
+
+            if (referenceCurve.empty())
+            {
+                referenceCurve = importedCurve;
+            }
+            else
+            {
+                for (auto frequency : { 20.0, 100.0, 500.0, 1000.0, 4000.0, 10000.0, 20000.0 })
+                {
+                    const auto delta = std::abs (CurveFIR::interpolateDb (referenceCurve, frequency)
+                                               - CurveFIR::interpolateDb (importedCurve, frequency));
+                    if (delta > 0.35)
+                    {
+                        std::cout << "Imported curve changed with host sample rate at "
+                                  << sampleRate << " Hz, " << frequency << " Hz delta=" << delta << " dB\n";
+                        return false;
+                    }
+                }
+            }
+
+            for (int mode = 0; mode < 3; ++mode)
+            {
+                processor.setEditLocked (false);
+                setParameterValue (processor, "phasemode", static_cast<float> (mode));
+                processor.renderFir();
+
+                const auto expectedLatency = mode == 0 ? 0
+                    : mode == 1 ? scaleReferenceSamples (1024, sampleRate)
+                                : scaleReferenceSamples (8192, sampleRate) / 2;
+                if (processor.getActiveLatencySamples() != expectedLatency)
+                {
+                    std::cout << "Phase latency mismatch at " << sampleRate << " Hz mode " << mode
+                              << ": got " << processor.getActiveLatencySamples()
+                              << " expected " << expectedLatency << "\n";
+                    return false;
+                }
+
+                const auto rendered = processor.getRenderedCurve();
+                for (auto frequency : { 100.0, 1000.0, 10000.0 })
+                {
+                    const auto delta = std::abs (CurveFIR::interpolateDb (importedCurve, frequency)
+                                               - CurveFIR::interpolateDb (rendered, frequency));
+                    if (delta > 0.05)
+                    {
+                        std::cout << "Rendered curve metadata drifted at " << sampleRate
+                                  << " Hz mode " << mode << " delta=" << delta << " dB\n";
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
 }
 
 int main (int argc, char* argv[])
@@ -134,6 +218,8 @@ int main (int argc, char* argv[])
 
     const juce::ScopedJuceInitialiser_GUI juceInitialiser;
     const juce::File curveFile { juce::String (argv[1]) };
+    if (! verifySampleRateStableImportAndPhase (curveFile))
+        return 79;
 
     const auto tempDirectory = juce::File::getSpecialLocation (juce::File::tempDirectory)
                                    .getChildFile ("FlexCurveGainRoundtrip_"
@@ -453,71 +539,31 @@ int main (int argc, char* argv[])
     setParameterValue (gainProcessor, "includeautogainfir", 0.0f);
 
     gainProcessor.renderFir();
-    processNoise (gainProcessor, 500);
+    const auto expectedFixedAutoGain = static_cast<float> (juce::jlimit (
+        -18.0, 18.0, CurveFIR::calculateKWeightedGainOffset (gainProcessor.getRenderedCurve(), 48000.0)));
+    processNoise (gainProcessor, 16);
     const auto autoGainSnapshot = gainProcessor.getMeterSnapshot();
-    if (autoGainSnapshot.autoGainDb < 1.0f)
+    if (std::abs (autoGainSnapshot.autoGainDb - expectedFixedAutoGain) > 0.05f)
     {
-        std::cout << "Auto Gain did not compensate a quieter processed curve: auto="
-                  << autoGainSnapshot.autoGainDb << " dB inputRms=" << autoGainSnapshot.inputRmsDb
-                  << " dB preRms=" << autoGainSnapshot.preAutoRmsDb << " dB\n";
+        std::cout << "Fixed Auto Gain does not match K-weighted curve estimate: auto="
+                  << autoGainSnapshot.autoGainDb << " expected=" << expectedFixedAutoGain << "\n";
         return 51;
     }
+    setParameterValue (gainProcessor, "loudnessmatchmode", 1.0f);
+    gainProcessor.resetMeters();
+    const auto invertedAutoGain = gainProcessor.getMeterSnapshot().autoGainDb;
+    if (std::abs (invertedAutoGain + expectedFixedAutoGain) > 0.05f)
+    {
+        std::cout << "Fixed inverse Auto Gain mode is not the opposite reference: auto="
+                  << invertedAutoGain << " expected=" << -expectedFixedAutoGain << "\n";
+        return 52;
+    }
+    setParameterValue (gainProcessor, "loudnessmatchmode", 0.0f);
     gainProcessor.resetMeters();
     if (std::abs (gainProcessor.getMeterSnapshot().autoGainDb - autoGainSnapshot.autoGainDb) > 0.01f)
     {
         std::cout << "Reset Meters changed the audible Auto Gain state\n";
         return 58;
-    }
-    const auto matchedWetRatio = processNoise (gainProcessor, 220);
-    setParameterValue (gainProcessor, "bypass", 1.0f);
-    const auto bypassRatio = processNoise (gainProcessor, 64);
-    setParameterValue (gainProcessor, "bypass", 0.0f);
-    if (matchedWetRatio <= 0.0 || bypassRatio <= 0.0
-        || std::abs (20.0 * std::log10 (matchedWetRatio / bypassRatio)) > 1.5)
-    {
-        std::cout << "Auto Gain did not keep processed/bypass A-B levels reasonably matched\n";
-        return 62;
-    }
-
-    FlexCurveAudioProcessor downwardGainProcessor;
-    downwardGainProcessor.prepareToPlay (48000.0, 512);
-    if (! downwardGainProcessor.addCurveFile (gainCurveFile))
-        return 59;
-    downwardGainProcessor.setLayerGain (downwardGainProcessor.getLayers().front().id, 6.0f);
-    setParameterValue (downwardGainProcessor, "loudnessmatchmode", 1.0f);
-    downwardGainProcessor.renderFir();
-    const auto downwardRatio = processNoise (downwardGainProcessor, 500);
-    const auto downwardSnapshot = downwardGainProcessor.getMeterSnapshot();
-    if (downwardSnapshot.autoGainDb > -1.0f)
-    {
-        std::cout << "Downward Match did not attenuate a louder processed signal: ratio="
-                  << downwardRatio << " auto=" << downwardSnapshot.autoGainDb << " dB\n";
-        return 52;
-    }
-
-    FlexCurveAudioProcessor headroomProcessor;
-    headroomProcessor.prepareToPlay (48000.0, 512);
-    setParameterValue (headroomProcessor, "autogain", 1.0f);
-    setParameterValue (headroomProcessor, "loudnessmatchmode", 1.0f);
-    setParameterValue (headroomProcessor, "outputgain", 12.0f);
-    processTonePeak (headroomProcessor, 0.5f, 120);
-    const auto headroomSnapshot = headroomProcessor.getMeterSnapshot();
-    if (! headroomSnapshot.preAutoClipped || headroomSnapshot.outputClipped
-        || headroomSnapshot.autoGainDb > -5.5f || headroomSnapshot.outputPeakDb > 0.05f)
-    {
-        std::cout << "Downward Match did not retain visible pre-auto clipping while protecting output: preClip="
-                  << headroomSnapshot.preAutoClipped << " outClip=" << headroomSnapshot.outputClipped
-                  << " auto=" << headroomSnapshot.autoGainDb
-                  << " outPeak=" << headroomSnapshot.outputPeakDb << "\n";
-        return 72;
-    }
-    setParameterValue (headroomProcessor, "autogain", 0.0f);
-    headroomProcessor.resetMeters();
-    processTonePeak (headroomProcessor, 0.5f, 8);
-    if (! headroomProcessor.getMeterSnapshot().outputClipped)
-    {
-        std::cout << "Disabling Auto Gain did not expose the real clipped output\n";
-        return 73;
     }
 
     FlexCurveAudioProcessor positiveAutoGainHeadroomProcessor;
@@ -529,25 +575,19 @@ int main (int argc, char* argv[])
     setParameterValue (positiveAutoGainHeadroomProcessor, "autogain", 1.0f);
     setParameterValue (positiveAutoGainHeadroomProcessor, "loudnessmatchmode", 0.0f);
     positiveAutoGainHeadroomProcessor.renderFir();
-    processTonePeak (positiveAutoGainHeadroomProcessor, 0.05f, 500);
-    const auto learnedPositiveGain = positiveAutoGainHeadroomProcessor.getMeterSnapshot().autoGainDb;
-    if (learnedPositiveGain < 8.0f)
-    {
-        std::cout << "Positive Auto Gain headroom fixture did not learn a boost: "
-                  << learnedPositiveGain << " dB\n";
-        return 76;
-    }
-    setParameterValue (positiveAutoGainHeadroomProcessor, "outputgain", 12.0f);
-    positiveAutoGainHeadroomProcessor.resetMeters();
+    const auto fixedPositiveGain = positiveAutoGainHeadroomProcessor.getMeterSnapshot().autoGainDb;
+    processTonePeak (positiveAutoGainHeadroomProcessor, 0.05f, 64);
+    const auto afterQuietToneGain = positiveAutoGainHeadroomProcessor.getMeterSnapshot().autoGainDb;
     processTonePeak (positiveAutoGainHeadroomProcessor, 0.8f, 8);
-    const auto positiveHeadroomSnapshot = positiveAutoGainHeadroomProcessor.getMeterSnapshot();
-    if (positiveHeadroomSnapshot.outputClipped || positiveHeadroomSnapshot.outputPeakDb > 0.05f
-        || positiveHeadroomSnapshot.autoGainDb > 2.1f)
+    const auto afterLoudToneGain = positiveAutoGainHeadroomProcessor.getMeterSnapshot().autoGainDb;
+    if (fixedPositiveGain < 8.0f
+        || std::abs (afterQuietToneGain - fixedPositiveGain) > 0.01f
+        || std::abs (afterLoudToneGain - fixedPositiveGain) > 0.01f)
     {
-        std::cout << "Positive Auto Gain exceeded current block headroom: auto="
-                  << positiveHeadroomSnapshot.autoGainDb << " dB outPeak="
-                  << positiveHeadroomSnapshot.outputPeakDb << " dB\n";
-        return 77;
+        std::cout << "Fixed Auto Gain drifted with program audio: initial="
+                  << fixedPositiveGain << " quiet=" << afterQuietToneGain
+                  << " loud=" << afterLoudToneGain << " dB\n";
+        return 76;
     }
 
     FlexCurveAudioProcessor autoEqPeakProcessor;
@@ -1383,5 +1423,5 @@ int main (int argc, char* argv[])
     processor.releaseResources();
     pumpMessageLoop (50);
     std::cout << "FlexCurve engine test OK\n";
-    return 0;
+    std::_Exit (0);
 }

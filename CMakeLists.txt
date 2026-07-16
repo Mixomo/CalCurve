@@ -15,6 +15,10 @@ endif()
 
 add_subdirectory("${JUCE_DIR}" "${CMAKE_BINARY_DIR}/third_party/JUCE")
 
+juce_add_binary_data(FlexCurveAssets
+    SOURCES
+        assets/ash_hpcf_catalog.tsv)
+
 juce_add_plugin(FlexCurve
     COMPANY_NAME "Mixomo"
     COMPANY_WEBSITE "https://github.com/Mixomo"
@@ -52,6 +56,7 @@ endif()
 
 target_link_libraries(FlexCurve
     PRIVATE
+        FlexCurveAssets
         juce::juce_audio_utils
         juce::juce_dsp
     PUBLIC
@@ -104,6 +109,7 @@ target_include_directories(FlexCurveEngineTest
 target_link_libraries(FlexCurveEngineTest
     PRIVATE
         FlexCurve
+        FlexCurveAssets
         juce::juce_audio_utils
         juce::juce_dsp
     PUBLIC

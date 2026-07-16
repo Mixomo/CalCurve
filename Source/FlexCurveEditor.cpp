@@ -1,4 +1,5 @@
 #include "FlexCurveEditor.h"
+#include "BinaryData.h"
 #include <limits>
 #include <numeric>
 
@@ -356,7 +357,8 @@ namespace
     juce::String flexCurveHelpText()
     {
         return
-            "FlexCurve is a non-destructive multi-layer correction-curve editor and FIR renderer with blending, Graphic EQ, Variable point editing, Parametric EQ, live preview, and project-style presets.\n\n"
+            "FlexCurve is a non-destructive multi-layer correction-curve editor and FIR renderer with local file import, an embedded offline ASH Toolset/reviewer catalog, blending, Graphic EQ, Variable point editing, Parametric EQ, live preview, and project-style presets.\n\n"
+            "CalCurve companion: CalCurve is the simpler sibling for finished correction curves. Use CalCurve when you only need to load one TXT/CSV/FIR calibration and apply it directly; use FlexCurve when you want layers, Target/RAW references, ASH Catalog browsing, AutoEQ, editing, comparison, and FIR rendering.\n\n"
             "FIR AND CONVOLUTION\n\n"
             "An FIR (finite impulse response) is a filter stored as a short audio-like impulse. Convolution applies that impulse to the audio. TXT and CSV curves are converted internally; WAV FIR files are read as magnitude responses and regenerated at the current sample rate. A rendered FIR can represent detailed correction continuously and can use Minimum, Natural, or Linear phase.\n\n"
             "SUPPORTED IMPORTS\n\n"
@@ -366,15 +368,17 @@ namespace
             "- APO CSV correction curves\n"
             "- Melda FreeForm EQ CSV exports\n"
             "- Equalizer APO parametric EQ text\n"
-            "- Stereo frequency/left dB/right dB rows and separate L/R gain directives\n\n"
+            "- Stereo frequency/left dB/right dB rows and separate L/R gain directives\n"
+            "- Offline ASH Toolset and reviewer-compilation HpCF catalog entries from the ASH Catalog tab. The ASH source catalog comes from Shanon Pearce's ASH-Toolset: https://github.com/ShanonPearce/ASH-Toolset\n\n"
             "LAYERS AND BLEND\n\n"
             "- Import Curve as a New Layer loads CSV, TXT, or WAV FIR.\n"
             "- Explicit Preamp/global gain from text curves is separated into the layer Gain slider instead of being hidden in curve points. FlexCurve FIR exports preserve that gain in WAV metadata; external FIRs without explicit metadata keep their measured response and default to 0.0 dB layer gain.\n"
             "- Add Curve as a New Layer creates a flat editable layer.\n"
+            "- ASH Catalog searches the embedded offline ASH Toolset and reviewer-compilation headphone-correction databases. The ASH source catalog comes from Shanon Pearce's ASH-Toolset: https://github.com/ShanonPearce/ASH-Toolset. Use the master search plus Reviewer/Measurement, Brand, and Model dropdown filters. The list shows each calibration with its reviewer. Add to Layer imports it as a normal editable EQ layer. Double-click auditions it through a hidden preview-only FIR path and draws it as a long-dashed, isolated PREVIEW curve without changing Average, layers, render, export, or presets.\n"
             "- Up to six user layers can coexist. Each has an embedded source curve, color, custom name, visibility, mute, solo, gain, Blend settings, Graphic/Variable EQ, and Parametric EQ.\n"
             "- EQ layers also have a Balance control. It applies a differential L/R dB offset to that layer's correction, so headphone channel-balance fixes are visible, audible, rendered, exported, and saved in presets.\n"
             "- Clone duplicates a layer's embedded curve, EQ banks, Variable points, Parametric filters, Blend, smoothing, inversion, and visibility state under a new name and color.\n"
-            "- The persistent color rack is available in every tab: V controls graph visibility, M excludes a layer from audio and Average, and S restricts audio and Average to soloed layers. Click the color circle to make that layer active.\n"
+            "- The persistent color rack is available in every tab: V controls graph visibility, M excludes a layer from audio and Average, S restricts audio and Average to soloed layers, and x deletes a layer directly without returning to the Blend tab. Click the color circle to make that layer active.\n"
             "- Average is the read-only white result derived live from audible layers and is used by preview and Render FIR.\n"
             "- Per Layer Blend applies Bass, Mid, Treble, and crossover settings to the active EQ layer. Global Blend keeps a separate regional-trim state and applies it to all EQ layers. Layer Gain always remains an independent per-layer control.\n"
             "- Invert reverses a layer correction around 0 dB.\n\n"
@@ -420,9 +424,8 @@ namespace
             "- Gain is a bipolar final output trim and moves audible EQ/Average curves. It does not rewrite or reposition RAW, Target, or Tracking references.\n"
             "- Input Gain is applied before correction and before the Input meter.\n"
             "- Output Gain is applied after correction and Auto Gain, before the final Global Gain stage.\n"
-            "- Auto Gain is an output trim for honest level-matched A/B monitoring. It does not change Input Gain, compress, reshape transients, or alter the FIR.\n"
-            "- Match Output to Input follows the RMS difference between corrected and input audio. It may boost or cut, but every audio block constrains positive compensation to its current peak headroom so previously learned gain cannot clip OUT after a curve or layer change.\n"
-            "- Downward Match never boosts. It also remembers the greatest required peak reduction and only ratchets downward until Auto Gain is disabled, its mode changes, or the project state resets it.\n"
+            "- Auto Gain is a fixed K-weighted estimate calculated from the current correction curve, clamped to +/-18 dB. Match OUT to IN applies the normal compensation; Match IN to OUT inverts that fixed reference. It updates when the curve, preview, render, mode, or host sample rate changes, but it does not learn dynamically from the incoming song.\n"
+            "- Auto Gain does not change Input Gain, compress, reshape transients, chase peaks, or alter the FIR unless Include Auto Gain in FIR export is enabled explicitly.\n"
             "- The meter shows live IN, PRE, and OUT RMS/Peak. PRE is measured after correction and manual output stages but before Auto Gain, so correction-induced clipping remains visible even when the final output is attenuated safely.\n"
             "- Meter bars, top peak numbers, and lower IN/AUTO/OUT readouts are dynamic. They do not latch held clip states; red/orange status follows the current audio block and Auto Gain amount.\n"
             "- Limiter is optional and only reduces peaks that exceed 0 dBFS.\n"
@@ -434,9 +437,9 @@ namespace
             "- Global dB Scale sets the bipolar gain range used by layer gain, Blend, Graphic EQ, Variable points, Parametric EQ, the global Gain control, and the graph. Presets are +/-12, +/-24, +/-36, and +/-48 dB; an editable custom value is also accepted.\n"
             "- Use + and - to zoom the graph vertically and 1:1 to reset it. Ctrl+mouse-wheel zooms. The mouse wheel scrolls vertically, with Shift for faster movement. A wheel directly over a Variable node edits that node instead. Curves outside the viewport are clipped rather than flattened against its borders.\n\n"
             "PREVIEW, FIR, AND PHASE\n\n"
-            "- Before rendering, a causal minimum-phase FIR preview follows the current Average in real time. Curve changes are rebuilt outside the audio thread and swapped into partitioned convolution. The preview FIR itself contains no hidden normalization; the separate Auto Gain stage runs only when its visible switch is enabled, and limiting occurs only when Limiter is enabled.\n"
+            "- Before rendering, a causal minimum-phase FIR preview follows the current Average in real time. ASH Catalog double-click preview temporarily feeds this backend preview path from an isolated hidden curve instead of Average; Add to Layer converts it into a real layer. Curve changes are rebuilt outside the audio thread and swapped into partitioned convolution. The preview FIR itself contains no hidden normalization; the separate Auto Gain stage runs only when its visible switch is enabled, and limiting occurs only when Limiter is enabled.\n"
             "- Render FIR commits the current Average to convolution and collapses the project into the rendered correction.\n"
-            "- The same transparent RMS Auto Gain stage is available in Preview and rendered FIR playback, keeping A/B behavior consistent.\n"
+            "- The same fixed curve-estimated Auto Gain stage is available in Preview and rendered FIR playback, keeping A/B behavior consistent without program-dependent level chasing.\n"
             "- Global Gain is monitoring-only and is never included in FIR export. Per-layer EQ gain is part of the correction. Output Gain and Auto Gain are included only when their explicit FIR-export switches are enabled.\n"
             "- Phase Mode is locked to Minimum during preview. After render it unlocks: Minimum is causal with zero reported latency; Natural is mixed-phase with moderate latency and reduced pre-ringing; Linear is symmetric with full latency and flat phase.\n"
             "- Any edit marks the FIR outdated, returns to Minimum preview, and requires a new render.\n"
@@ -448,7 +451,7 @@ namespace
             "PRESETS\n\n"
             "- The Presets menu loads, saves, and deletes .flexcurvepreset files in %APPDATA%\\Mixomo\\FlexCurve\\UserPresets\\.\n"
             "- Compatible .calcurvepreset and XML state files can be loaded for migration from CalCurve.\n"
-            "- Presets embed every source curve plus names, colors, V/M/S, complete L/R link/selection/edit state, layer gains, normalization offsets, source smoothing, Blend, Graphic/Variable EQ, Parametric filters, active layer, Average state, Input/Output Gain, Auto Gain mode, FIR-export options, global controls, phase, and rendered state where available.\n"
+            "- Presets embed every source curve plus names, colors, V/M/S, complete L/R link/selection/edit state, layer gains, normalization offsets, source smoothing, Blend, Graphic/Variable EQ, Parametric filters, ASH Catalog browser filters/selection/preview, active layer, Average state, Input/Output Gain, Auto Gain enabled state, FIR-export options, global controls, phase, and rendered state where available.\n"
             "- Embedded curves keep presets usable if original imported files move or disappear.\n\n"
             "CREDITS\n\n"
             "Development: Ezequiel Casas (Mixomo)\nhttps://github.com/Mixomo\n\n"
@@ -458,6 +461,7 @@ namespace
             "AutoEq:\nhttps://github.com/jaakkopasanen/AutoEq\n\n"
             "squig.link:\nhttps://squig.link/\n\n"
             "MeldaProduction:\nhttps://www.meldaproduction.com/\n\n"
+            "ASH Toolset / Shanon Pearce:\nhttps://github.com/ShanonPearce/ASH-Toolset\n\n"
             "Steinberg / VST3 SDK:\nhttps://github.com/steinbergmedia/vst3sdk\n\n"
             "JUCE:\nhttps://juce.com/\n\n"
             "Microsoft MSVC / Visual Studio C++ toolchain:\nhttps://visualstudio.microsoft.com/\n\n"
@@ -472,6 +476,7 @@ namespace
     {
     public:
         HelpContent()
+            : calCurveLink ("Check CalCurve", juce::URL ("https://github.com/Mixomo/CalCurve"))
         {
             text.setMultiLine (true);
             text.setReadOnly (true);
@@ -482,16 +487,23 @@ namespace
             text.setFont (juce::FontOptions (16.0f));
             text.setText (flexCurveHelpText(), false);
             addAndMakeVisible (text);
+            calCurveLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff2ee0b8));
+            calCurveLink.setTooltip ("Open the CalCurve repository");
+            addAndMakeVisible (calCurveLink);
             setSize (900, 760);
         }
 
         void resized() override
         {
-            text.setBounds (getLocalBounds().reduced (12));
+            auto area = getLocalBounds().reduced (12);
+            calCurveLink.setBounds (area.removeFromBottom (34).removeFromLeft (180));
+            area.removeFromBottom (6);
+            text.setBounds (area);
         }
 
     private:
         juce::TextEditor text;
+        juce::HyperlinkButton calCurveLink;
     };
 }
 
@@ -642,6 +654,14 @@ void FlexCurveGraph::setVariableEditingAllowed (bool allowed)
         draggingFreeformIndex = -1;
         paintingFreeform = false;
     }
+    repaint();
+}
+
+void FlexCurveGraph::setAshPreviewVisible (bool visible)
+{
+    if (ashPreviewVisible == visible)
+        return;
+    ashPreviewVisible = visible;
     repaint();
 }
 
@@ -1012,6 +1032,24 @@ void FlexCurveGraph::paint (juce::Graphics& g)
                                        selected == FlexChannelSelection::left ? 2.0f : 2.8f);
             }
         }
+    }
+
+    const auto ashPreview = ashPreviewVisible
+        ? graphDisplayAudioCurveFor (processor, processor.getAshPreviewCurve(), FlexChannelSelection::left)
+        : std::vector<CurvePoint>();
+    if (! ashPreview.empty())
+    {
+        const auto previewPath = buildPath (ashPreview, graph, minDb, maxDb);
+        juce::Path dashedPreview;
+        const float pattern[] { 22.0f, 10.0f };
+        juce::PathStrokeType (1.6f).createDashedStroke (dashedPreview, previewPath, pattern, 2);
+        g.setColour (accentColour().withAlpha (0.82f));
+        g.fillPath (dashedPreview);
+        g.setColour (accentColour().withAlpha (0.68f));
+        g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+        g.drawText ("PREVIEW",
+                    graph.withTrimmedLeft (graph.getWidth() - 98.0f).withTrimmedBottom (graph.getHeight() - 20.0f).toNearestInt(),
+                    juce::Justification::centredRight);
     }
 
     if (isVariableEditingActive() && ! freeform.empty())
@@ -3102,6 +3140,374 @@ private:
     std::vector<int> selectedBands;
 };
 
+class FlexCurveAudioProcessorEditor::AshCatalogTab final : public juce::Component,
+                                                           private juce::ListBoxModel
+{
+public:
+    explicit AshCatalogTab (FlexCurveAudioProcessor& p) : processor (p)
+    {
+        search.setTextToShowWhenEmpty ("Search ASH headphones...", mutedColour());
+        search.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff0c1116));
+        search.setColour (juce::TextEditor::textColourId, inkColour());
+        search.setColour (juce::TextEditor::outlineColourId, juce::Colour (0xff3d4a56));
+        search.onTextChange = [this] { refilter(); };
+        addAndMakeVisible (search);
+
+        for (auto* combo : { &reviewerFilter, &measurementFilter, &brandFilter, &modelFilter })
+        {
+            styleCombo (*combo);
+            combo->onChange = [this] { refilter(); };
+            addAndMakeVisible (*combo);
+        }
+
+        addSelected.setButtonText ("Add to Layer");
+        styleButton (addSelected);
+        addSelected.onClick = [this] { addCurrentSelection(); };
+        addAndMakeVisible (addSelected);
+
+        status.setColour (juce::Label::textColourId, mutedColour());
+        status.setJustificationType (juce::Justification::centredLeft);
+        status.setFont (juce::FontOptions (13.0f));
+        addAndMakeVisible (status);
+
+        list.setModel (this);
+        list.setRowHeight (26);
+        list.setColour (juce::ListBox::backgroundColourId, panelColour());
+        addAndMakeVisible (list);
+        updateStatus();
+    }
+
+    ~AshCatalogTab() override
+    {
+        list.setModel (nullptr);
+    }
+
+    void resized() override
+    {
+        ensureCatalogLoaded();
+        auto area = getLocalBounds().reduced (12);
+        auto top = area.removeFromTop (34);
+        search.setBounds (top.removeFromLeft (juce::jmax (320, top.getWidth() - 360)).reduced (0, 2));
+        top.removeFromLeft (10);
+        addSelected.setBounds (top.removeFromLeft (260).reduced (0, 2));
+        top.removeFromLeft (10);
+        status.setBounds (top);
+        area.removeFromTop (8);
+
+        auto filters = area.removeFromTop (34);
+        const auto filterW = juce::jmax (160, filters.getWidth() / 4 - 8);
+        reviewerFilter.setBounds (filters.removeFromLeft (filterW).reduced (0, 2));
+        filters.removeFromLeft (8);
+        measurementFilter.setBounds (filters.removeFromLeft (filterW).reduced (0, 2));
+        filters.removeFromLeft (8);
+        brandFilter.setBounds (filters.removeFromLeft (filterW).reduced (0, 2));
+        filters.removeFromLeft (8);
+        modelFilter.setBounds (filters.reduced (0, 2));
+        area.removeFromTop (8);
+
+        list.setBounds (area);
+    }
+
+    void visibilityChanged() override
+    {
+        ensureCatalogLoaded();
+    }
+
+private:
+    struct Entry
+    {
+        juce::String reviewer, brand, model, type, rig;
+        std::vector<CurvePoint> points;
+
+        juce::String label() const
+        {
+            auto text = reviewer + " | " + brand + " - " + model;
+            if (type.isNotEmpty()) text += " (" + type + ")";
+            if (rig.isNotEmpty()) text += " [" + rig + "]";
+            return text;
+        }
+
+        juce::String haystack() const
+        {
+            return (reviewer + " " + brand + " " + model + " " + type + " " + rig).toLowerCase();
+        }
+
+        juce::String measurement() const
+        {
+            auto text = type;
+            if (rig.isNotEmpty())
+                text += (text.isNotEmpty() ? " | " : "") + rig;
+            return text;
+        }
+    };
+
+    static std::vector<Entry>& catalog()
+    {
+        static auto* entries = new std::vector<Entry>();
+        return *entries;
+    }
+
+    static bool& catalogLoaded()
+    {
+        static bool loaded = false;
+        return loaded;
+    }
+
+    void loadCatalog()
+    {
+        if (catalogLoaded())
+            return;
+
+        catalogLoaded() = true;
+        auto text = juce::String::fromUTF8 (BinaryData::ash_hpcf_catalog_tsv, BinaryData::ash_hpcf_catalog_tsvSize);
+        auto lines = juce::StringArray::fromLines (text);
+        std::vector<double> frequencies;
+
+        for (const auto& line : lines)
+        {
+            if (line.isEmpty() || line.startsWithChar ('#'))
+                continue;
+
+            auto cols = juce::StringArray::fromTokens (line, "\t", {});
+            if (cols.size() < 2)
+                continue;
+
+            if (cols[0] == "FREQUENCIES")
+            {
+                for (const auto& value : juce::StringArray::fromTokens (cols[1], ",", {}))
+                    frequencies.push_back (value.getDoubleValue());
+                continue;
+            }
+
+            if (cols[0] == "reviewer")
+                continue;
+
+            if (cols.size() < 6 || frequencies.empty())
+                continue;
+
+            auto mags = juce::StringArray::fromTokens (cols[5], ",", {});
+            if (mags.size() != static_cast<int> (frequencies.size()))
+                continue;
+
+            Entry entry;
+            entry.reviewer = cols[0];
+            entry.brand = cols[1];
+            entry.model = cols[2];
+            entry.type = cols[3];
+            entry.rig = cols[4];
+            entry.points.reserve (frequencies.size());
+            for (int i = 0; i < mags.size(); ++i)
+                entry.points.push_back ({ frequencies[static_cast<size_t> (i)], mags[i].getDoubleValue() });
+
+            catalog().push_back (std::move (entry));
+        }
+    }
+
+    void ensureCatalogLoaded()
+    {
+        if (didFilter)
+            return;
+        if (! isShowing())
+            return;
+        loadCatalog();
+        populateFilterCombos();
+        restoreBrowserState();
+        refilter();
+        didFilter = true;
+    }
+
+    static juce::String selectedFilter (const juce::ComboBox& combo)
+    {
+        return combo.getSelectedId() > 1 ? combo.getText() : juce::String();
+    }
+
+    static void populateCombo (juce::ComboBox& combo, const juce::String& allText, juce::StringArray values)
+    {
+        const auto previous = combo.getText();
+        combo.onChange = nullptr;
+        combo.clear (juce::dontSendNotification);
+        combo.addItem (allText, 1);
+        values.removeEmptyStrings();
+        values.removeDuplicates (false);
+        values.sort (true);
+        int id = 2;
+        for (const auto& value : values)
+            combo.addItem (value, id++);
+        combo.setSelectedId (values.contains (previous) ? values.indexOf (previous) + 2 : 1, juce::dontSendNotification);
+    }
+
+    void populateFilterCombos()
+    {
+        juce::StringArray reviewers, measurements, brands, models;
+        for (const auto& entry : catalog())
+        {
+            reviewers.add (entry.reviewer);
+            measurements.add (entry.measurement());
+            brands.add (entry.brand);
+            models.add (entry.model);
+        }
+
+        populateCombo (reviewerFilter, "All reviewers", reviewers);
+        populateCombo (measurementFilter, "All measurements", measurements);
+        populateCombo (brandFilter, "All brands", brands);
+        populateCombo (modelFilter, "All models", models);
+
+        for (auto* combo : { &reviewerFilter, &measurementFilter, &brandFilter, &modelFilter })
+            combo->onChange = [this] { refilter(); };
+    }
+
+    static void setComboTextIfPresent (juce::ComboBox& combo, const juce::String& text)
+    {
+        if (text.isEmpty())
+        {
+            combo.setSelectedId (1, juce::dontSendNotification);
+            return;
+        }
+        for (int i = 0; i < combo.getNumItems(); ++i)
+            if (combo.getItemText (i) == text)
+            {
+                combo.setSelectedItemIndex (i, juce::dontSendNotification);
+                return;
+            }
+    }
+
+    juce::String selectedEntryLabel() const
+    {
+        const auto row = list.getSelectedRow();
+        if (row < 0 || row >= static_cast<int> (filtered.size()))
+            return {};
+        return catalog()[static_cast<size_t> (filtered[static_cast<size_t> (row)])].label();
+    }
+
+    void saveBrowserState()
+    {
+        processor.setAshCatalogBrowserState (search.getText(),
+                                             selectedFilter (reviewerFilter),
+                                             selectedFilter (measurementFilter),
+                                             selectedFilter (brandFilter),
+                                             selectedFilter (modelFilter),
+                                             selectedEntryLabel());
+    }
+
+    void restoreBrowserState()
+    {
+        const auto state = processor.getAshCatalogBrowserState();
+        if (state.size() < 6)
+            return;
+        search.setText (state[0], false);
+        setComboTextIfPresent (reviewerFilter, state[1]);
+        setComboTextIfPresent (measurementFilter, state[2]);
+        setComboTextIfPresent (brandFilter, state[3]);
+        setComboTextIfPresent (modelFilter, state[4]);
+    }
+
+    void refilter()
+    {
+        filtered.clear();
+        const auto query = search.getText().toLowerCase().trim();
+        const auto reviewer = selectedFilter (reviewerFilter);
+        const auto measurement = selectedFilter (measurementFilter);
+        const auto brand = selectedFilter (brandFilter);
+        const auto model = selectedFilter (modelFilter);
+        const auto& entries = catalog();
+        for (int i = 0; i < static_cast<int> (entries.size()); ++i)
+        {
+            const auto& entry = entries[static_cast<size_t> (i)];
+            if ((query.isEmpty() || entry.haystack().contains (query))
+                && (reviewer.isEmpty() || entry.reviewer == reviewer)
+                && (measurement.isEmpty() || entry.measurement() == measurement)
+                && (brand.isEmpty() || entry.brand == brand)
+                && (model.isEmpty() || entry.model == model))
+                filtered.push_back (i);
+        }
+
+        list.updateContent();
+        if (! filtered.empty())
+        {
+            const auto wanted = processor.getAshCatalogBrowserState().size() >= 6
+                ? processor.getAshCatalogBrowserState()[5] : juce::String();
+            auto rowToSelect = 0;
+            for (int row = 0; row < static_cast<int> (filtered.size()); ++row)
+                if (catalog()[static_cast<size_t> (filtered[static_cast<size_t> (row)])].label() == wanted)
+                {
+                    rowToSelect = row;
+                    break;
+                }
+            list.selectRow (rowToSelect);
+        }
+        saveBrowserState();
+        updateStatus();
+        updateAddButton();
+    }
+
+    int getNumRows() override { return static_cast<int> (filtered.size()); }
+
+    void paintListBoxItem (int row, juce::Graphics& g, int width, int height, bool selected) override
+    {
+        if (selected)
+            g.fillAll (juce::Colour (0xff22313d));
+        if (row < 0 || row >= static_cast<int> (filtered.size()))
+            return;
+
+        const auto& entry = catalog()[static_cast<size_t> (filtered[static_cast<size_t> (row)])];
+        g.setColour (selected ? inkColour() : juce::Colour (0xffd8e3df));
+        g.setFont (juce::FontOptions (14.0f));
+        g.drawText (entry.label(), 8, 0, width - 16, height, juce::Justification::centredLeft, true);
+    }
+
+    void listBoxItemDoubleClicked (int, const juce::MouseEvent&) override { previewCurrentSelection(); }
+
+    void selectedRowsChanged (int) override { saveBrowserState(); }
+
+    void previewCurrentSelection()
+    {
+        const auto row = list.getSelectedRow();
+        if (row < 0 || row >= static_cast<int> (filtered.size()))
+            return;
+
+        const auto& entry = catalog()[static_cast<size_t> (filtered[static_cast<size_t> (row)])];
+        saveBrowserState();
+        processor.setAshPreviewCurve ("ASH Preview: " + entry.label(), entry.points);
+        updateStatus();
+    }
+
+    void addCurrentSelection()
+    {
+        const auto row = list.getSelectedRow();
+        if (row < 0 || row >= static_cast<int> (filtered.size()))
+            return;
+
+        const auto& entry = catalog()[static_cast<size_t> (filtered[static_cast<size_t> (row)])];
+        if (! processor.addCurvePoints ("ASH: " + entry.label(), entry.points))
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::AlertWindow::InfoIcon, "FlexCurve", "Maximum of 6 user layers reached.");
+        updateStatus();
+    }
+
+    void updateAddButton()
+    {
+        addSelected.setEnabled (processor.canAddUserLayer() && list.getSelectedRow() >= 0 && ! processor.isEditLocked());
+    }
+
+    void updateStatus()
+    {
+        const auto preview = processor.getAshPreviewLabel();
+        status.setText (juce::String (filtered.size()) + " / " + juce::String (catalog().size()) + " ASH filters"
+                            + (preview.isNotEmpty() ? " | PREVIEW" : ""),
+                        juce::dontSendNotification);
+        updateAddButton();
+    }
+
+    FlexCurveAudioProcessor& processor;
+    juce::TextEditor search;
+    juce::ComboBox reviewerFilter, measurementFilter, brandFilter, modelFilter;
+    juce::TextButton addSelected;
+    juce::Label status;
+    juce::ListBox list { "ASHCatalog", this };
+    std::vector<int> filtered;
+    bool didFilter = false;
+};
+
 class FlexCurveAudioProcessorEditor::GlobalLayerRack final : public juce::Component,
                                                              private juce::ScrollBar::Listener
 {
@@ -3159,7 +3565,7 @@ public:
             return;
         }
 
-        constexpr int rowWidth = 286;
+        constexpr int rowWidth = 322;
         constexpr int rowHeight = 30;
         constexpr int gap = 5;
         const auto totalWidth = static_cast<int> (rows.size()) * rowWidth
@@ -3246,6 +3652,29 @@ private:
         bool active = false;
     };
 
+    class RackDeleteButton final : public juce::Button
+    {
+    public:
+        RackDeleteButton() : juce::Button ("Delete layer") {}
+
+        void paintButton (juce::Graphics& g, bool highlighted, bool down) override
+        {
+            auto bounds = getLocalBounds().toFloat().reduced (3.0f);
+            auto background = juce::Colour (0xff151b21);
+            if (highlighted)
+                background = juce::Colour (0xff3b2024);
+            if (down)
+                background = background.darker (0.12f);
+            g.setColour (background);
+            g.fillRoundedRectangle (bounds, 5.0f);
+            g.setColour (juce::Colour (0xffaeb8c2));
+            g.drawRoundedRectangle (bounds, 5.0f, 1.0f);
+            g.setColour (juce::Colour (0xffff7a82));
+            g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+            g.drawText ("x", getLocalBounds(), juce::Justification::centred);
+        }
+    };
+
     struct Row final : juce::Component,
                        juce::SettableTooltipClient
     {
@@ -3262,6 +3691,8 @@ private:
             styleCombo (channel);
             channel.setTooltip ("Editing channel for this layer");
             addAndMakeVisible (channel);
+            remove.setTooltip ("Delete this layer");
+            addAndMakeVisible (remove);
 
             colourButton.onClick = [this] { processor.setActiveLayerId (layerId); };
 
@@ -3290,6 +3721,7 @@ private:
                         static_cast<FlexChannelSelection> (channel.getSelectedId() - 1));
                 }
             };
+            remove.onClick = [this] { processor.removeLayer (layerId); };
         }
 
         void sync()
@@ -3325,6 +3757,7 @@ private:
             mute.setEnabled (isEq && ! processor.isEditLocked());
             solo.setEnabled (isEq && ! processor.isEditLocked());
             channel.setEnabled (true);
+            remove.setEnabled (! processor.isEditLocked());
             repaint();
         }
 
@@ -3341,6 +3774,7 @@ private:
             mute.setBounds (area.removeFromLeft (34).reduced (1, 0));
             solo.setBounds (area.removeFromLeft (34).reduced (1, 0));
             channel.setBounds (area.removeFromLeft (122).reduced (4, 2));
+            remove.setBounds (area.removeFromLeft (32).reduced (2, 2));
         }
 
         FlexCurveAudioProcessor& processor;
@@ -3353,6 +3787,7 @@ private:
         RackToggleButton mute { "M" };
         RackToggleButton solo { "S" };
         juce::ComboBox channel;
+        RackDeleteButton remove;
     };
 
     FlexCurveAudioProcessor& processor;
@@ -3635,6 +4070,7 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
     resetAll.onClick = [this]
     {
         processor.resetAll();
+        processor.clearAshPreviewCurve();
         updatePresetCombo();
         updateActiveLayerCombo();
         updateAddButtons();
@@ -3764,12 +4200,12 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
     styleButton (crossfeedAdvanced);
     crossfeedAdvanced.setTooltip ("Open advanced crossfeed algorithm and geometry settings");
     crossfeedAdvanced.onClick = [this] { openCrossfeedAdvanced(); };
-    loudnessMatchMode.addItem ("Match Output to Input", 1);
-    loudnessMatchMode.addItem ("Downward Match", 2);
-    autoGain.setTooltip ("Slow transparent RMS level matching without compression or limiting");
-    loudnessMatchMode.setTooltip ("Choose bidirectional matching or attenuation-only Downward Match");
+    loudnessMatchMode.addItem ("Match OUT to IN", 1);
+    loudnessMatchMode.addItem ("Match IN to OUT", 2);
+    autoGain.setTooltip ("Fixed K-weighted curve compensation calculated from the current correction");
+    loudnessMatchMode.setTooltip ("Choose the direction of the fixed curve-based Auto Gain reference");
     includeOutputGainFir.setTooltip ("Explicitly bake Output Gain into exported FIR files");
-    includeAutoGainFir.setTooltip ("Explicitly bake the current learned Auto Gain into exported FIR files");
+    includeAutoGainFir.setTooltip ("Explicitly bake the fixed Auto Gain estimate into exported FIR files");
     independentLrPreamp.setTooltip (
         "Advanced: calculate separate safe AutoEQ preamps for L and R. This can change stereo balance.");
     addAndMakeVisible (*graphResizeHandle);
@@ -3777,9 +4213,11 @@ FlexCurveAudioProcessorEditor::FlexCurveAudioProcessorEditor (FlexCurveAudioProc
     blendTab = std::make_unique<BlendTab> (processor);
     graphicTab = std::make_unique<GraphicTab> (processor, graph);
     parametricTab = std::make_unique<ParametricTab> (processor);
+    ashCatalogTab = std::make_unique<AshCatalogTab> (processor);
     tabs.addTab ("Blend", surfaceColour(), blendTab.get(), false);
     tabs.addTab ("Graphic EQ", surfaceColour(), graphicTab.get(), false);
     tabs.addTab ("Parametric EQ", surfaceColour(), parametricTab.get(), false);
+    tabs.addTab ("ASH Catalog", surfaceColour(), ashCatalogTab.get(), false);
     tabs.setTabBarDepth (38);
     tabs.setOutline (1);
     tabs.setColour (juce::TabbedComponent::backgroundColourId, panelColour());
@@ -4062,6 +4500,7 @@ void FlexCurveAudioProcessorEditor::timerCallback()
     processor.setLastOpenTabIndex (tabs.getCurrentTabIndex());
     graph.repaint();
     graph.setVariableEditingAllowed (tabs.getCurrentTabIndex() == 1 && ! processor.isEditLocked());
+    graph.setAshPreviewVisible (tabs.getCurrentTabIndex() == 3);
     const auto phaseSelectable = processor.canSelectPhaseMode();
     phaseMode.setEnabled (phaseSelectable);
     exportFir.setEnabled (processor.canExportRenderedFir());

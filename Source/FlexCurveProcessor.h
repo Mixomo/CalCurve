@@ -190,6 +190,7 @@ public:
 
     static constexpr int maxUserLayers = 6;
     bool addCurveFile (const juce::File& file);
+    bool addCurvePoints (const juce::String& name, std::vector<CurvePoint> points);
     bool addReferenceCurveFile (const juce::File& file, FlexCurveLayerType type);
     bool addFlatCurve();
     bool cloneLayer (int id);
@@ -231,6 +232,17 @@ public:
 
     std::vector<FlexCurveLayer> getLayers() const;
     std::vector<CurvePoint> getFinalCurve() const;
+    std::vector<CurvePoint> getAshPreviewCurve() const;
+    juce::String getAshPreviewLabel() const;
+    void setAshPreviewCurve (const juce::String& label, std::vector<CurvePoint> points);
+    void clearAshPreviewCurve();
+    void setAshCatalogBrowserState (const juce::String& search,
+                                     const juce::String& reviewer,
+                                     const juce::String& measurement,
+                                     const juce::String& brand,
+                                     const juce::String& model,
+                                     const juce::String& selectedLabel);
+    juce::StringArray getAshCatalogBrowserState() const;
     std::vector<CurvePoint> getRenderedCurve() const;
     std::vector<CurvePoint> getLayerCurve (int id) const;
     std::vector<CurvePoint> getLayerCurve (int id, FlexChannelSelection channel) const;
@@ -309,7 +321,7 @@ public:
     juce::String getPresetName() const;
     void setEditLocked (bool shouldLock);
     bool isEditLocked() const noexcept { return editLocked.load(); }
-    void setLastOpenTabIndex (int index) noexcept { lastOpenTabIndex.store (juce::jlimit (0, 2, index)); }
+    void setLastOpenTabIndex (int index) noexcept { lastOpenTabIndex.store (juce::jlimit (0, 3, index)); }
     int getLastOpenTabIndex() const noexcept { return lastOpenTabIndex.load(); }
     juce::File getPresetsDirectory() const
     {
@@ -364,6 +376,8 @@ private:
         const FlexCurveLayer& layer, FlexChannelSelection channel) const;
     std::vector<CurvePoint> calculateAverageCurveLocked (
         FlexChannelSelection channel = FlexChannelSelection::left) const;
+    std::vector<CurvePoint> calculatePreviewCurveLocked (
+        FlexChannelSelection channel = FlexChannelSelection::left) const;
     std::vector<CurvePoint> calculateAverageCurveForTypeLocked (FlexCurveLayerType type,
                                                                  bool applyReferenceDisplayOffset = false,
                                                                  FlexChannelSelection channel = FlexChannelSelection::left) const;
@@ -396,8 +410,7 @@ private:
     void applyGlobalBalance (juce::AudioBuffer<float>& buffer, float balanceDb) const;
     void resetCrossfeed();
     void updateMeters (const juce::AudioBuffer<float>& buffer, bool input);
-    void updateRuntimeAutoGain (float inputPower, float outputPower, float outputPeak,
-                                float downstreamGain, int numSamples);
+    void updateFixedAutoGainFromCurrentCurve() noexcept;
     void resetAutoGainState() noexcept;
     void addLayersToState (juce::ValueTree& state) const;
     void restoreLayersFromState (const juce::ValueTree& state);
@@ -436,6 +449,11 @@ private:
     std::vector<FlexCurveLayer> layers;
     std::vector<CurvePoint> finalCurve;
     std::vector<CurvePoint> finalCurveRight;
+    std::vector<CurvePoint> ashPreviewCurve;
+    juce::String ashPreviewLabel;
+    juce::String ashCatalogSearch, ashCatalogReviewer, ashCatalogMeasurement;
+    juce::String ashCatalogBrand, ashCatalogModel, ashCatalogSelectedLabel;
+    std::atomic<bool> ashPreviewActive { false };
     std::vector<CurvePoint> renderedCurve;
     std::vector<CurvePoint> renderedCurveRight;
     int nextLayerId = 1;
@@ -465,11 +483,6 @@ private:
     std::atomic<bool> previewFiltersDirty { true };
     std::atomic<bool> previewFirReady { false };
     std::atomic<float> runtimeAutoGainDb { 0.0f };
-    std::atomic<float> smoothedRuntimeAutoGainDb { 0.0f };
-    std::atomic<bool> autoGainResetRequested { false };
-    double inputPowerIntegrator = 0.0;
-    double outputPowerIntegrator = 0.0;
-    juce::int64 autoGainSampleCount = 0;
 
     std::atomic<float> inputPeakDb { -100.0f };
     std::atomic<float> inputRmsDb { -100.0f };

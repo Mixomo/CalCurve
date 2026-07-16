@@ -155,6 +155,7 @@ public:
     std::vector<int> getSelectedFreeformIndices() const;
     void selectFreeformPoint (int index, bool additive);
     void setVariableEditingAllowed (bool allowed);
+    void setAshPreviewVisible (bool visible);
     void zoomIn();
     void zoomOut();
     void resetZoom();
@@ -195,6 +196,7 @@ private:
     };
     std::vector<LegendHitBox> legendHitBoxes;
     bool variableEditingAllowed = false;
+    bool ashPreviewVisible = false;
     double viewZoom = 1.0;
     double viewCentreDb = 0.0;
     double viewHalfRangeDb = 12.0;
@@ -214,6 +216,7 @@ private:
     class BlendTab;
     class GraphicTab;
     class ParametricTab;
+    class AshCatalogTab;
     class GlobalLayerRack;
     class MeterPanel;
     class GraphResizeHandle;
@@ -238,6 +241,7 @@ private:
     std::unique_ptr<BlendTab> blendTab;
     std::unique_ptr<GraphicTab> graphicTab;
     std::unique_ptr<ParametricTab> parametricTab;
+    std::unique_ptr<AshCatalogTab> ashCatalogTab;
     std::unique_ptr<GlobalLayerRack> globalLayerRack;
     std::unique_ptr<MeterPanel> meterPanel;
     std::unique_ptr<GraphResizeHandle> graphResizeHandle;

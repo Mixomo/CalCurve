@@ -1,17 +1,21 @@
 # FlexCurve
 
-FlexCurve is a VST3 headphone-correction curve editor and FIR renderer. It imports local TXT, CSV, and WAV FIR calibrations as editable layers, previews changes in real time, blends them into an Average curve, and renders the result as a Minimum, Natural, or Linear phase FIR.
+FlexCurve is a VST3 headphone-correction curve editor and FIR renderer. It imports local TXT, CSV, and WAV FIR calibrations, and also includes an embedded offline ASH Toolset/reviewer catalog that can be previewed or added as editable layers. FlexCurve previews changes in real time, blends active layers into an Average curve, and renders the result as a Minimum, Natural, or Linear phase FIR.
+
+CalCurve is the simpler companion plugin for finished correction curves: load one TXT/CSV/FIR calibration and apply it directly.
+CalCurve lives at [github.com/Mixomo/CalCurve](https://github.com/Mixomo/CalCurve).
 
 ![FlexCurve](assets/FlexCurve.png)
 ![FlexCurve](assets/FlexCurve2.png)
 ![FlexCurve](assets/FlexCurve3.png)
 ![FlexCurve](assets/FlexCurve4.png)
+![FlexCurve](assets/FlexCurve5.png)
 
 ## Copy / Install FlexCurve VST3
 
 You do not need to build FlexCurve to use it.
 
-1. Download `FlexCurve.zip` from the [GitHub Releases page](https://github.com/Mixomo/FlexCurve/releases).
+1. Download `FlexCurve.zip` from the Releases section.
 2. Extract the ZIP.
 3. Copy the complete `FlexCurve.vst3` folder to:
 
@@ -44,17 +48,18 @@ When a text/APO curve declares a global `Preamp` or gain directive, FlexCurve se
 
 ## Current Build State
 
-As of June 20, 2026, the FlexCurve branch contains the current VST3-only release candidate:
+As of July 16, 2026, the FlexCurve branch contains the current VST3-only release candidate:
 
 - non-destructive EQ, Target, and RAW layer editing with up to six user EQ layers
 - independent L/R layer state, channel selection, linking, split-channel render/export, and per-layer balance trim
+- embedded offline ASH Toolset and reviewer-compilation headphone-correction catalog
 - live Minimum-phase FIR preview with rendered Minimum, Natural, and Linear phase modes
 - Graphic EQ 15-band, 31-band, and Variable point editing with copy/paste rules across modes and layers
 - Parametric EQ with an unrestricted scrollable filter list
 - AutoEQ generation from Target and RAW references with corrected-measurement tracking
 - Advanced Crossfeed window with Natural and BS2B/RME-style algorithms
 - global Dry/Wet, Crossfeed, Balance, Input Gain, Output Gain, Global Gain, Auto Gain, Limiter, and Bypass
-- dynamic IN, PRE, and OUT meter display with live peak/RMS readouts and Auto Gain compensation status
+- dynamic IN, PRE, and OUT meter display with live peak/RMS readouts and fixed Auto Gain compensation status
 - project presets with embedded curve data, CalCurve preset migration, and ready-to-copy VST3 bundle output
 
 ## Supported Imports
@@ -67,6 +72,7 @@ As of June 20, 2026, the FlexCurve branch contains the current VST3-only release
 - Equalizer APO parametric EQ text
 - Stereo frequency/dB text rows in `frequency left_dB right_dB` form
 - Separate `Preamp L` / `Preamp R` or `Left Gain` / `Right Gain` directives
+- Embedded offline ASH Toolset and reviewer-compilation HpCF catalog entries from the **ASH Catalog** tab. The ASH source catalog comes from [ShanonPearce/ASH-Toolset](https://github.com/ShanonPearce/ASH-Toolset).
 
 ## Layers And Blend
 
@@ -74,6 +80,7 @@ FlexCurve starts with an empty graph. Use:
 
 - **Import Curve as a New Layer** to load TXT, CSV, WAV, or FIR files
 - **Add Curve as a New Layer** to create a flat editable layer
+- **ASH Catalog** to search the embedded offline ASH Toolset and reviewer-compilation headphone-correction databases. The ASH source catalog comes from [ShanonPearce/ASH-Toolset](https://github.com/ShanonPearce/ASH-Toolset). Use the master search plus Reviewer/Measurement, Brand, and Model dropdown filters. The list shows each calibration with its reviewer. **Add to Layer** imports it as a normal editable layer; double-click auditions it through a hidden preview-only FIR path and draws it as a long-dashed, isolated `PREVIEW` curve without changing Average, layers, render, export, or presets.
 
 Up to six user layers can coexist. Every layer stores its source curve, color, custom name, visibility, mute, solo, gain, Blend settings, Graphic/Variable EQ, and Parametric EQ.
 
@@ -85,6 +92,7 @@ The compact layer rack remains visible in every tab:
 - **V** shows or hides it in the graph
 - **M** removes it from audio and from the Average calculation
 - **S** restricts audio and Average to soloed layers
+- **x** deletes the layer directly from the rack without returning to the Blend tab
 - hover the color circle to see the complete layer name
 
 The graph legend also selects layers. The active-layer text is informational and always shows the full active name.
@@ -197,9 +205,8 @@ Each filter has enable, type, frequency, gain, Q, reset, and delete controls. Th
 - **Gain** is a bipolar final output trim and moves audible EQ and Average curves without rewriting or repositioning RAW, Target, or Tracking references.
 - **Input Gain** is applied before correction and before Input metering.
 - **Output Gain** is applied after correction/Auto Gain and before Global Gain.
-- **Auto Gain** is an output-only trim for honest level-matched A/B monitoring. It applies gain only: no compression, transient shaping, or FIR modification.
-- **Match Output to Input** follows the RMS difference between corrected and input audio. It may boost or cut, but every block constrains positive compensation to its currently available peak headroom so learned gain cannot clip OUT after a layer or curve change.
-- **Downward Match** never boosts. It remembers the greatest peak reduction required and ratchets downward until Auto Gain is disabled, its mode changes, or the project state resets it.
+- **Auto Gain** is a fixed K-weighted estimate calculated from the current correction curve and clamped to `-18..+18 dB`. **Match OUT to IN** applies the normal compensation; **Match IN to OUT** inverts that fixed reference. It updates when the curve, preview, render, mode, or host sample rate changes, but it does not learn dynamically from the incoming song.
+- Auto Gain applies gain only: no compression, transient shaping, peak chasing, or FIR modification unless **Include Auto Gain in FIR export** is enabled explicitly.
 - **Meters** show live IN, PRE, and OUT RMS/Peak. PRE is measured after correction and manual output stages but before Auto Gain, so correction-induced clipping remains visible even if the final output is attenuated safely.
 - Meter bars, top peak numbers, and lower IN/AUTO/OUT readouts are dynamic. They do not latch held clip states; red/orange status follows the current audio block and Auto Gain amount.
 - **Phase Mode** remains locked to Minimum during live preview and unlocks after FIR rendering.
@@ -216,13 +223,13 @@ Fixed Graphic and Parametric bands support `Ctrl+left click` multi-selection. Va
 
 ## Preview, Render, And Phase
 
-Before rendering, FlexCurve uses a causal minimum-phase FIR preview derived from the current Average. Curve edits are coalesced, rebuilt outside `processBlock`, and loaded into a partitioned convolution engine, so the audio thread never performs FFT construction or memory allocation.
+Before rendering, FlexCurve uses a causal minimum-phase FIR preview derived from the current Average. ASH Catalog double-click preview temporarily feeds this backend preview path from an isolated hidden curve instead of Average; **Add to Layer** converts it into a real editable layer. Curve edits are coalesced, rebuilt outside `processBlock`, and loaded into a partitioned convolution engine, so the audio thread never performs FFT construction or memory allocation.
 
 This follows the same core approach as a real-time Graphic EQ FIR engine: the kernel may change while audio is running. FIR describes the filter structure, not an immutable file. Parametric filter responses are included in the combined target curve before the preview FIR is generated.
 
 **Render FIR** commits the Average to convolution and collapses the project into a clean rendered correction. Any later edit marks the FIR as outdated, returns to Minimum preview, and requires a new render.
 
-Auto Gain behaves consistently in Preview and rendered playback. Global Gain remains a monitoring stage and is never baked into the FIR. Per-layer EQ gain is part of the correction. Output Gain and Auto Gain enter FIR exports only when their explicit **Include ... in FIR export** switches are enabled.
+Auto Gain behaves consistently in Preview and rendered playback because it is estimated from the correction curve, not from program audio. Global Gain remains a monitoring stage and is never baked into the FIR. Per-layer EQ gain is part of the correction. Output Gain and Auto Gain enter FIR exports only when their explicit **Include ... in FIR export** switches are enabled.
 
 Phase engines:
 
@@ -251,8 +258,9 @@ A preset embeds:
 - V/M/S state and layer gain
 - Blend, Graphic/Variable, and Parametric edits
 - active layer and Average state
+- ASH Catalog search, dropdown filters, selected entry, and isolated preview curve
 - global controls and phase mode
-- Input/Output Gain, Auto Gain, loudness-match mode, and FIR-export gain options
+- Input/Output Gain, fixed Auto Gain enabled state, and FIR-export gain options
 - Target/RAW normalization offsets and per-layer source smoothing
 - L/R channel selection, link state, and complete independent edits for both channels
 - rendered state when available
@@ -374,7 +382,7 @@ Pass a real local correction file:
   C:\Audio\TestCurves\headphone-correction.txt
 ```
 
-This exercises imports, live preview, concurrent processing, FIR rendering, and editor lifecycle stress.
+This exercises imports, fixed Auto Gain, live preview, concurrent processing, FIR rendering, editor lifecycle stress, phase-mode latency, and sample-rate-stable curve/FIR reconstruction at `44100`, `48000`, `88200`, `96000`, `176400`, and `192000` Hz.
 
 ### Basic VST3 Host Test
 
@@ -409,7 +417,7 @@ Expected checkpoints include plugin discovery, instance creation, editor availab
   --fir-test C:\Audio\TestCurves\headphone-correction.csv
 ```
 
-This validates Minimum, Natural, and Linear FIR generation at 44.1, 48, 88.2, 96, 176.4, and 192 kHz.
+This validates Minimum, Natural, and Linear FIR generation at 44.1, 48, 88.2, 96, 176.4, and 192 kHz. The engine test also imports the same TXT/CSV/WAV file through the processor at those host rates and verifies the visible curve and phase latencies stay stable.
 
 ### WAV FIR Import
 
@@ -439,6 +447,7 @@ scripts/            Repository-style build scripts
 - **AutoEq:** [github.com/jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq)
 - **squig.link:** [squig.link](https://squig.link/)
 - **MeldaProduction:** [meldaproduction.com](https://www.meldaproduction.com/)
+- **ASH Toolset / Shanon Pearce:** [github.com/ShanonPearce/ASH-Toolset](https://github.com/ShanonPearce/ASH-Toolset)
 - **Steinberg / VST3 SDK:** [github.com/steinbergmedia/vst3sdk](https://github.com/steinbergmedia/vst3sdk)
 - **JUCE:** [juce.com](https://juce.com/)
 - **Microsoft MSVC / Visual Studio C++ toolchain:** [visualstudio.microsoft.com](https://visualstudio.microsoft.com/)

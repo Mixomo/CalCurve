@@ -108,6 +108,15 @@ private:
     int crossfeedWrite = 0;
     float lpL = 0.0f;
     float lpR = 0.0f;
+    double bs2bA0Lo = 0.0;
+    double bs2bB1Lo = 0.0;
+    double bs2bA0Hi = 1.0;
+    double bs2bA1Hi = 0.0;
+    double bs2bB1Hi = 0.0;
+    double bs2bGain = 1.0;
+    double bs2bLo[2] = {};
+    double bs2bHi[2] = {};
+    double bs2bPrevInput[2] = {};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CalCurveAudioProcessor)
 };

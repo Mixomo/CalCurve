@@ -42,6 +42,7 @@ private:
     void openFileChooser();
     void openExportFirChooser();
     void showHelp();
+    void openCrossfeedAdvanced();
     void styleSlider (juce::Slider& slider, const juce::String& suffix = {});
     void updatePresetCombo();
     void handlePresetComboChange();
@@ -65,6 +66,7 @@ private:
     juce::TextButton loadFile { "Load TXT / CSV / FIR" };
     juce::TextButton exportFir { "Export FIR" };
     juce::TextButton help { "Help" };
+    juce::TextButton crossfeedAdvanced { "Advanced" };
     juce::ComboBox presetCombo { "Presets" };
     std::vector<juce::File> presetFiles;
     std::unique_ptr<juce::FileChooser> chooser;

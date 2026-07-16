@@ -9,6 +9,8 @@
 !LICENSE
 !README.md
 !THIRD_PARTY_NOTICES.md
+!build_calcurve.bat
+!build_calcurve.ps1
 
 # Vendored build dependencies
 !third_party/
@@ -32,6 +34,9 @@ CalCurve_VST3/**/*.locktest
 # Build helper files
 !cmake/
 !cmake/*.cmake
+!scripts/
+!scripts/*.bat
+!scripts/*.ps1
 
 # Tools and tests
 !tools/

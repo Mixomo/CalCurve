@@ -43,6 +43,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout CalCurveAudioProcessor::crea
         juce::AudioProcessorParameter::genericParameter,
         [] (float val, int) { return juce::String (juce::roundToInt (val * 100.0f)) + " %"; },
         [] (const juce::String& text) { return static_cast<float> (text.getDoubleValue() / 100.0); }));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> (
+        "crossfeedalgorithm", "Crossfeed Algorithm", juce::StringArray { "Natural", "BS2B" }, 0));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedcircumference", "Crossfeed Head Circumference",
+        juce::NormalisableRange<float> (45.0f, 70.0f, 0.1f), 57.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedheadwidth", "Crossfeed Head Width",
+        juce::NormalisableRange<float> (10.0f, 22.0f, 0.1f), 15.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedheadlength", "Crossfeed Head Length",
+        juce::NormalisableRange<float> (14.0f, 25.0f, 0.1f), 19.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedangle", "Crossfeed Speaker Angle",
+        juce::NormalisableRange<float> (10.0f, 90.0f, 0.1f), 60.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeedcutoff", "Crossfeed Cutoff",
+        juce::NormalisableRange<float> (200.0f, 2500.0f, 1.0f), 700.0f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        "crossfeeddirect", "Crossfeed Direct",
+        juce::NormalisableRange<float> (50.0f, 120.0f, 0.1f), 100.0f));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
         "gain", "Gain", juce::NormalisableRange<float> (-24.0f, 12.0f, 0.01f), 0.0f));
@@ -74,8 +94,8 @@ void CalCurveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     
     wetBuffer.setSize (getTotalNumOutputChannels(), samplesPerBlock);
     
-    // 1 ms is enough for headphone crossfeed ITD at all normal sample rates.
-    crossfeedDelay.setSize (2, juce::jmax (32, static_cast<int> (std::ceil (sampleRate * 0.001))));
+    // Extra delay headroom for geometry-based crossfeed at high sample rates.
+    crossfeedDelay.setSize (2, juce::jmax (32, static_cast<int> (std::ceil (sampleRate * 0.003))));
     resetCrossfeed();
 
     dryDelayBuffer.setSize (getTotalNumOutputChannels(), 131072);
@@ -603,6 +623,15 @@ void CalCurveAudioProcessor::resetCrossfeed()
     crossfeedWrite = 0;
     lpL = 0.0f;
     lpR = 0.0f;
+    bs2bA0Lo = 0.0;
+    bs2bB1Lo = 0.0;
+    bs2bA0Hi = 1.0;
+    bs2bA1Hi = 0.0;
+    bs2bB1Hi = 0.0;
+    bs2bGain = 1.0;
+    bs2bLo[0] = bs2bLo[1] = 0.0;
+    bs2bHi[0] = bs2bHi[1] = 0.0;
+    bs2bPrevInput[0] = bs2bPrevInput[1] = 0.0;
 }
 
 void CalCurveAudioProcessor::applyCrossfeed (juce::AudioBuffer<float>& buffer, float amount)
@@ -612,38 +641,85 @@ void CalCurveAudioProcessor::applyCrossfeed (juce::AudioBuffer<float>& buffer, f
 
     auto* left = buffer.getWritePointer (0);
     auto* right = buffer.getWritePointer (1);
+    const auto algorithm = juce::roundToInt (parameters.getRawParameterValue ("crossfeedalgorithm")->load());
+    const auto sampleRate = currentSampleRate > 0.0 ? currentSampleRate : 48000.0;
+    const auto cutoffHz = juce::jlimit (200.0f, 2500.0f, parameters.getRawParameterValue ("crossfeedcutoff")->load());
+    const auto directGain = juce::jlimit (0.5f, 1.2f, parameters.getRawParameterValue ("crossfeeddirect")->load() / 100.0f);
+
+    if (algorithm == 1)
+    {
+        const auto feed = juce::jlimit (10.0, 150.0, 45.0 + static_cast<double> (amount) * 50.0) / 10.0;
+        const auto fcut = juce::jlimit (300.0, 2000.0, static_cast<double> (cutoffHz));
+        const auto gbLo = feed * -5.0 / 6.0 - 3.0;
+        const auto gbHi = feed / 6.0 - 3.0;
+        const auto gLo = juce::Decibels::decibelsToGain (gbLo);
+        const auto gHi = 1.0 - juce::Decibels::decibelsToGain (gbHi);
+        const auto fcHi = fcut * std::pow (2.0, (gbLo - 20.0 * std::log10 (juce::jmax (1.0e-9, gHi))) / 12.0);
+        auto x = std::exp (-juce::MathConstants<double>::twoPi * fcut / sampleRate);
+        bs2bB1Lo = x;
+        bs2bA0Lo = gLo * (1.0 - x);
+        x = std::exp (-juce::MathConstants<double>::twoPi * fcHi / sampleRate);
+        bs2bB1Hi = x;
+        bs2bA0Hi = 1.0 - gHi * (1.0 - x);
+        bs2bA1Hi = -x;
+        bs2bGain = 1.0 / (1.0 - gHi + gLo);
+
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            const auto inL = static_cast<double> (left[i]);
+            const auto inR = static_cast<double> (right[i]);
+            bs2bLo[0] = bs2bA0Lo * inL + bs2bB1Lo * bs2bLo[0];
+            bs2bLo[1] = bs2bA0Lo * inR + bs2bB1Lo * bs2bLo[1];
+            bs2bHi[0] = bs2bA0Hi * inL + bs2bA1Hi * bs2bPrevInput[0] + bs2bB1Hi * bs2bHi[0];
+            bs2bHi[1] = bs2bA0Hi * inR + bs2bA1Hi * bs2bPrevInput[1] + bs2bB1Hi * bs2bHi[1];
+            bs2bPrevInput[0] = inL;
+            bs2bPrevInput[1] = inR;
+            const auto wetL = (bs2bHi[0] + bs2bLo[1]) * bs2bGain * static_cast<double> (directGain);
+            const auto wetR = (bs2bHi[1] + bs2bLo[0]) * bs2bGain * static_cast<double> (directGain);
+            left[i] = static_cast<float> (inL + amount * (wetL - inL));
+            right[i] = static_cast<float> (inR + amount * (wetR - inR));
+        }
+        return;
+    }
+
     auto* delayL = crossfeedDelay.getWritePointer (0);
     auto* delayR = crossfeedDelay.getWritePointer (1);
     const auto delaySize = crossfeedDelay.getNumSamples();
 
-    const auto lpAlpha = static_cast<float> (1.0 - std::exp (-juce::MathConstants<double>::twoPi * 900.0 / currentSampleRate));
-    const auto width = juce::jmap (amount, 1.0f, 0.42f);
-    const auto crossGain = 0.16f * amount;
-    auto delayOffset = static_cast<int> (std::round (0.00028 * currentSampleRate));
-    delayOffset = juce::jlimit (1, delaySize - 1, delayOffset);
+    const auto circumferenceCm = juce::jlimit (45.0f, 70.0f, parameters.getRawParameterValue ("crossfeedcircumference")->load());
+    const auto headWidthCm = juce::jlimit (10.0f, 22.0f, parameters.getRawParameterValue ("crossfeedheadwidth")->load());
+    const auto headLengthCm = juce::jlimit (14.0f, 25.0f, parameters.getRawParameterValue ("crossfeedheadlength")->load());
+    const auto angleDeg = juce::jlimit (10.0f, 90.0f, parameters.getRawParameterValue ("crossfeedangle")->load());
+    const auto theta = static_cast<double> (angleDeg) * juce::MathConstants<double>::pi / 180.0;
+    const auto halfHead = static_cast<double> (headWidthCm) / 200.0;
+    const auto frontOffset = static_cast<double> (headLengthCm) / 200.0;
+    const auto circumferenceRadius = static_cast<double> (circumferenceCm) / (2.0 * juce::MathConstants<double>::pi * 100.0);
+    const auto speakerDistance = 1.0 + frontOffset;
+    const auto dFar = std::sqrt (speakerDistance * speakerDistance + halfHead * halfHead
+                               + 2.0 * speakerDistance * halfHead * std::sin (theta * 0.5));
+    const auto dNear = std::sqrt (speakerDistance * speakerDistance + halfHead * halfHead
+                                - 2.0 * speakerDistance * halfHead * std::sin (theta * 0.5));
+    const auto pathDelay = (dFar - dNear) / 343.0;
+    const auto headShadowDelay = circumferenceRadius * std::sin (theta * 0.5) / 343.0;
+    const auto delaySeconds = juce::jmax (0.00005, 0.65 * pathDelay + 0.35 * headShadowDelay);
+    const auto delaySamples = juce::jlimit (1, delaySize - 1, static_cast<int> (std::round (delaySeconds * sampleRate)));
+    const auto lpAlpha = static_cast<float> (1.0 - std::exp (-juce::MathConstants<double>::twoPi * static_cast<double> (cutoffHz) / sampleRate));
+    const auto width = 1.0f + amount * (0.42f - 1.0f);
+    const auto feed = 0.16f * amount;
 
     for (int i = 0; i < buffer.getNumSamples(); ++i)
     {
         const auto inL = left[i];
         const auto inR = right[i];
-
+        delayL[crossfeedWrite] = inL;
+        delayR[crossfeedWrite] = inR;
+        const auto read = (crossfeedWrite - delaySamples + delaySize) % delaySize;
+        lpL += lpAlpha * (delayL[read] - lpL);
+        lpR += lpAlpha * (delayR[read] - lpR);
         const auto mid = 0.5f * (inL + inR);
         const auto side = 0.5f * (inL - inR) * width;
-
-        lpL += lpAlpha * (inL - lpL);
-        lpR += lpAlpha * (inR - lpR);
-
-        const int readIdx = (crossfeedWrite - delayOffset + delaySize) % delaySize;
-
-        const auto delayedLpL = delayL[readIdx];
-        const auto delayedLpR = delayR[readIdx];
-
-        left[i]  = mid + side + crossGain * delayedLpR;
-        right[i] = mid - side + crossGain * delayedLpL;
-
-        delayL[crossfeedWrite] = lpL;
-        delayR[crossfeedWrite] = lpR;
-
+        left[i] = ((mid + side) + feed * lpR) * directGain;
+        right[i] = ((mid - side) + feed * lpL) * directGain;
         crossfeedWrite = (crossfeedWrite + 1) % delaySize;
     }
 }

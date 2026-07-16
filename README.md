@@ -6,6 +6,10 @@ CalCurve loads local headphone calibration files and applies them as convolution
 
 The tool is intentionally narrow: it does not include a headphone database, headphone simulation, or target selection. It assumes the loaded file is already an exported/calibrated correction curve.
 
+Need the larger editor? **FlexCurve** is the advanced companion for multi-layer curve editing, blends, Target/RAW references, AutoEQ, Graphic/Variable/Parametric EQ editing, ASH catalog imports, and FIR rendering/export workflows:
+
+[Check FlexCurve](https://github.com/Mixomo/CalCurve/tree/FlexCurve)
+
 ---
 
 # Copy / Install CalCurve VST3
@@ -67,6 +71,7 @@ The TXT/CSV curve is still useful as an editable and portable description of the
 
 * **Dry/Wet:** blends the original signal with the corrected signal.
 * **Crossfeed:** stereo headphone crossfeed for headphone listening.
+* **Advanced Crossfeed:** opens algorithm and geometry controls. Natural uses geometry-based delay/head-shadow style crossfeed. BS2B uses a filtered crossfeed topology. Presets expose editable head circumference, head width, head length, speaker angle, cutoff, and direct level values.
 * **Gain:** final output trim in dB.
 * **Phase Mode:** selects the FIR phase engine.
 
@@ -101,7 +106,7 @@ CalCurve creates this folder automatically when the presets menu is used.
 
 A preset stores:
 
-* Dry/Wet, Crossfeed, Gain, Phase Mode, Limiter, and Bypass state
+* Dry/Wet, Crossfeed, Advanced Crossfeed, Gain, Phase Mode, Limiter, and Bypass state
 * the custom preset name
 * the path to the loaded calibration file
 * the loaded file label shown in the interface
@@ -233,13 +238,23 @@ So although RBJ-style biquad math is involved during import parsing, the final a
 
 # Crossfeed
 
-Crossfeed is intentionally lightweight and separate from the FIR correction engine.
+Crossfeed is intentionally separate from the FIR correction engine.
 
-It narrows headphone stereo width slightly by introducing:
+The main **Crossfeed** knob controls the amount. The **Advanced** button opens the algorithm and parameter panel.
 
-* a small delayed opposite-channel feed
-* low-pass filtering
-* controlled crossfeed gain
+Available algorithms:
+
+* **Natural:** geometry-based crossfeed using head dimensions, speaker angle, delay, head-shadow style low-pass filtering, and direct level.
+* **BS2B:** filtered crossfeed inspired by classic speaker-to-headphone crossfeed topology.
+
+Advanced parameters:
+
+* head circumference
+* head width
+* head length
+* speaker angle
+* cutoff
+* direct level
 
 The goal is to reduce extreme hard-panned headphone separation without heavily altering the correction curve itself.
 
@@ -298,7 +313,41 @@ CalCurve/
     JUCE/
 ```
 
-From the `CalCurve` repository folder, configure the build:
+The simplest build path is the end-to-end script from the repository folder:
+
+```powershell
+.\build_calcurve.bat
+```
+
+That script:
+
+* configures CMake into `_build_verify`
+* builds `CalCurve_VST3`
+* builds `CalCurveVST3SmokeTest`
+* runs process, editor, and preset-roundtrip smoke tests
+* updates the ready-to-copy bundle at `CalCurve_VST3/CalCurve.vst3`
+
+To also run FIR phase validation with one local calibration file:
+
+```powershell
+.\build_calcurve.bat -TestCurve "<path-to-your-calibration-curve.txt>"
+```
+
+Useful options:
+
+```powershell
+.\build_calcurve.bat -SkipTests
+.\build_calcurve.bat -NoBundleCopy
+.\build_calcurve.bat -BuildDir "_build_verify" -Config "Release"
+```
+
+You can also call the ordered PowerShell script directly:
+
+```powershell
+.\scripts\build-calcurve-vst3.ps1
+```
+
+Manual CMake commands are still supported. From the `CalCurve` repository folder, configure the build:
 
 ```powershell
 cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
@@ -335,8 +384,11 @@ This checks:
 * VST3 discovery
 * plugin description parsing
 * instance creation
+* expected CalCurve VST3 identity
+* required parameter availability, including Advanced Crossfeed parameters
 * editor availability
-* one empty audio process block
+* finite audio processing at 44.1, 48, 96, and 192 kHz
+* Natural and BS2B crossfeed processing paths
 
 Briefly open the editor:
 

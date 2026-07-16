@@ -8,6 +8,84 @@ namespace
 {
     constexpr double referenceSampleRate = 44100.0;
 
+    juce::String getArgumentValue (int argc, char* argv[], const juce::String& flag)
+    {
+        for (int i = 2; i + 1 < argc; ++i)
+            if (juce::String (argv[i]).equalsIgnoreCase (flag))
+                return juce::String (argv[i + 1]);
+
+        return {};
+    }
+
+    bool hasArgument (int argc, char* argv[], const juce::String& flag)
+    {
+        for (int i = 2; i < argc; ++i)
+            if (juce::String (argv[i]).equalsIgnoreCase (flag))
+                return true;
+
+        return false;
+    }
+
+    juce::AudioProcessorParameter* findParameter (juce::AudioProcessor& processor, const juce::String& id)
+    {
+        auto normalise = [] (juce::String text)
+        {
+            juce::String result;
+            text = text.toLowerCase();
+
+            for (auto c : text)
+                if (juce::CharacterFunctions::isLetterOrDigit (c))
+                    result << c;
+
+            return result;
+        };
+
+        const auto wanted = normalise (id);
+
+        for (auto* parameter : processor.getParameters())
+            if (parameter != nullptr)
+                if (parameter->getName (128).equalsIgnoreCase (id)
+                 || normalise (parameter->getName (128)) == wanted)
+                    return parameter;
+
+        return nullptr;
+    }
+
+    bool setParameterNormalised (juce::AudioProcessor& processor, const juce::String& id, float normalisedValue)
+    {
+        if (auto* parameter = findParameter (processor, id))
+        {
+            parameter->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, normalisedValue));
+            return true;
+        }
+
+        std::cout << "Missing parameter: " << id << "\n";
+        return false;
+    }
+
+    bool requireParameter (juce::AudioProcessor& processor, const juce::String& id)
+    {
+        if (findParameter (processor, id) != nullptr)
+            return true;
+
+        std::cout << "Required parameter not found: " << id << "\n";
+        std::cout << "Available parameters:\n";
+        for (auto* parameter : processor.getParameters())
+            if (parameter != nullptr)
+                std::cout << "  " << parameter->getName (128) << "\n";
+        return false;
+    }
+
+    bool isFiniteBuffer (const juce::AudioBuffer<float>& buffer)
+    {
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+                if (! std::isfinite (buffer.getSample (channel, sample)))
+                    return false;
+
+        return true;
+    }
+
     int scaleReferenceSamples (int referenceSamples, double sampleRate)
     {
         auto scaled = static_cast<int> (std::round (static_cast<double> (referenceSamples) * sampleRate / referenceSampleRate));
@@ -161,14 +239,36 @@ int main (int argc, char* argv[])
     std::cout << "Instance created\n";
     std::cout << "Has editor: " << (instance->hasEditor() ? "yes" : "no") << "\n";
 
-    const auto openEditor = argc > 2 && juce::String (argv[2]).equalsIgnoreCase ("--editor");
-    const auto testFir = argc > 3 && juce::String (argv[2]).equalsIgnoreCase ("--fir-test");
-    const auto testWavFir = argc > 3 && juce::String (argv[2]).equalsIgnoreCase ("--wav-fir-test");
-    const auto testPreset = argc > 2 && juce::String (argv[2]).equalsIgnoreCase ("--preset-roundtrip");
+    if (! description.name.containsIgnoreCase ("CalCurve"))
+    {
+        std::cout << "Unexpected plugin name: " << description.name << "\n";
+        return 8;
+    }
+
+    if (! description.pluginFormatName.containsIgnoreCase ("VST3"))
+    {
+        std::cout << "Unexpected plugin format: " << description.pluginFormatName << "\n";
+        return 9;
+    }
+
+    for (const auto& id : { "Dry/Wet", "Crossfeed", "Crossfeed Algorithm", "Crossfeed Head Circumference",
+                           "Crossfeed Head Width", "Crossfeed Head Length", "Crossfeed Speaker Angle",
+                           "Crossfeed Cutoff", "Crossfeed Direct", "Gain", "Phase Mode", "Limiter", "Bypass" })
+    {
+        if (! requireParameter (*instance, id))
+            return 10;
+    }
+
+    const auto openEditor = hasArgument (argc, argv, "--editor");
+    const auto testPreset = hasArgument (argc, argv, "--preset-roundtrip");
+    const auto firPath = getArgumentValue (argc, argv, "--fir-test");
+    const auto wavFirPath = getArgumentValue (argc, argv, "--wav-fir-test");
+    const auto testFir = firPath.isNotEmpty();
+    const auto testWavFir = wavFirPath.isNotEmpty();
 
     if (testFir)
     {
-        const juce::File curveFile { juce::String (argv[3]) };
+        const juce::File curveFile { firPath };
         const auto points = CurveFIR::parseCurveFile (curveFile);
         std::cout << "Curve points: " << points.size() << "\n";
 
@@ -215,7 +315,7 @@ int main (int argc, char* argv[])
         juce::AudioFormatManager audioFormatManager;
         audioFormatManager.registerBasicFormats();
 
-        const juce::File wavFile { juce::String (argv[3]) };
+        const juce::File wavFile { wavFirPath };
 
         if (auto reader = std::unique_ptr<juce::AudioFormatReader> (audioFormatManager.createReaderFor (wavFile)))
         {
@@ -295,14 +395,40 @@ int main (int argc, char* argv[])
         std::cout << "Editor OK\n";
     }
 
-    instance->setRateAndBufferSizeDetails (48000.0, 512);
-    instance->prepareToPlay (48000.0, 512);
+    for (auto sampleRate : { 44100.0, 48000.0, 96000.0, 192000.0 })
+    {
+        instance->setRateAndBufferSizeDetails (sampleRate, 512);
+        instance->prepareToPlay (sampleRate, 512);
 
-    juce::AudioBuffer<float> buffer (2, 512);
-    buffer.clear();
-    juce::MidiBuffer midi;
-    instance->processBlock (buffer, midi);
-    instance->releaseResources();
+        for (int algorithm = 0; algorithm < 2; ++algorithm)
+        {
+            if (! setParameterNormalised (*instance, "Crossfeed", 0.65f)
+             || ! setParameterNormalised (*instance, "Crossfeed Algorithm", static_cast<float> (algorithm)))
+                return 11;
+
+            juce::AudioBuffer<float> buffer (2, 512);
+            buffer.clear();
+
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+            {
+                const auto t = static_cast<float> (sample) / static_cast<float> (sampleRate);
+                buffer.setSample (0, sample, std::sin (juce::MathConstants<float>::twoPi * 440.0f * t) * 0.1f);
+                buffer.setSample (1, sample, std::sin (juce::MathConstants<float>::twoPi * 660.0f * t) * 0.1f);
+            }
+
+            juce::MidiBuffer midi;
+            instance->processBlock (buffer, midi);
+
+            if (! isFiniteBuffer (buffer))
+            {
+                std::cout << "Process produced non-finite samples at " << sampleRate
+                          << " Hz, crossfeed algorithm " << algorithm << "\n";
+                return 12;
+            }
+        }
+
+        instance->releaseResources();
+    }
 
     std::cout << "Process OK\n";
     return 0;

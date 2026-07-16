@@ -22,7 +22,8 @@ namespace
             "Note: WAV is the supported impulse-response FIR container. Non-WAV .fir files are treated as text curve files, not raw binary FIR files.\n\n"
             "Controls\n\n"
             "- Dry/Wet: blends the latency-aligned dry signal with the corrected wet signal. At 0% the graph is flat; at 100% it shows the full loaded correction.\n\n"
-            "- Crossfeed: stereo headphone crossfeed. It narrows side information and adds a small delayed, low-passed opposite-channel feed for more natural headphone listening.\n\n"
+            "- Crossfeed: stereo headphone crossfeed for more natural headphone listening. It runs after the FIR correction stage.\n\n"
+            "- Advanced Crossfeed: opens algorithm and geometry settings. Natural uses geometry-based delay/head-shadow style crossfeed. BS2B uses a filtered crossfeed topology. Presets expose editable head circumference, head width, head length, speaker angle, cutoff, and direct level values.\n\n"
             "- Gain: final output trim in dB, applied after Dry/Wet and Crossfeed.\n\n"
             "- Phase Mode: regenerates the active FIR whenever the mode changes. FIR length and latency are scaled from a 44.1 kHz reference so the correction keeps the same time/frequency resolution at 48, 96, 192 kHz, and other host sample rates. At 44.1 kHz, Minimum uses a 4096-tap minimum-phase FIR and reports 0 samples; Natural uses a 4096-tap mixed-phase FIR with 0.72 minimum-phase weighting and reports 1024 samples; Linear uses an 8192-tap symmetric linear-phase FIR and reports 4096 samples.\n\n"
             "- Auto Gain (hidden): when a curve or FIR is loaded, CalCurve estimates the K-weighted perceived loudness change and applies a clamped -18 dB to +18 dB compensation to the corrected wet path. The Gain knob is not moved.\n\n"
@@ -33,7 +34,7 @@ namespace
             "Presets and state\n\n"
             "- The Presets menu can select user presets, save the current preset, and delete the active custom preset.\n\n"
             "- On Windows, user presets are stored in %APPDATA%/Mixomo/CalCurve/UserPresets as .calcurvepreset files. CalCurve creates this folder automatically.\n\n"
-            "- A preset stores Dry/Wet, Crossfeed, Gain, Phase Mode, Limiter, Bypass, custom preset name, loaded file path, loaded file label, and an embedded copy of the loaded correction curve as frequency/dB points.\n\n"
+            "- A preset stores Dry/Wet, Crossfeed, Advanced Crossfeed settings, Gain, Phase Mode, Limiter, Bypass, custom preset name, loaded file path, loaded file label, and an embedded copy of the loaded correction curve as frequency/dB points.\n\n"
             "- When a preset is loaded, CalCurve first tries to reload the original file from the saved path. If the file is still there, it uses that file so the preset follows deliberate calibration updates.\n\n"
             "- If the original file is missing, renamed, or moved, CalCurve falls back to the embedded frequency/dB curve stored inside the preset and rebuilds the FIR from that. This makes presets portable.\n\n"
             "- For WAV FIR files, the preset embeds the magnitude curve extracted from the WAV, not the raw WAV samples. The selected Phase Mode still regenerates the active FIR from that embedded curve.\n\n"
@@ -52,6 +53,8 @@ namespace
             "- Linear is linear phase with latency scaled from 4096 samples at 44.1 kHz.\n\n"
             "- FIR tap counts are also scaled with the host sample rate. This keeps the EQ curve stable instead of changing shape at high sample rates.\n\n"
             "- Some DAWs may compensate or hide plugin latency during playback or monitoring, but the GUI latency and IR peak readout show the active engine.\n\n"
+            "FlexCurve companion\n\n"
+            "- FlexCurve is the advanced companion to CalCurve. Use it when you want multi-layer curve editing, blends, Target/RAW references, AutoEQ, Graphic/Variable/Parametric EQ editing, ASH catalog imports, and FIR rendering/export workflows.\n\n"
             "Credits\n\n"
             "- Development: Ezequiel Casas (Mixomo)\n\n"
             "https://github.com/Mixomo\n\n"
@@ -95,16 +98,192 @@ namespace
             text.setFont (juce::FontOptions (18.0f));
             text.setText (helpText(), false);
             addAndMakeVisible (text);
+
+            flexCurveLink.setColour (juce::HyperlinkButton::textColourId, accentColour());
+            flexCurveLink.setTooltip ("Open the FlexCurve branch on GitHub");
+            addAndMakeVisible (flexCurveLink);
+
             setSize (820, 680);
         }
 
         void resized() override
         {
-            text.setBounds (getLocalBounds().reduced (18));
+            auto area = getLocalBounds().reduced (18);
+            flexCurveLink.setBounds (area.removeFromBottom (34).removeFromLeft (180));
+            area.removeFromBottom (8);
+            text.setBounds (area);
         }
 
     private:
         juce::TextEditor text;
+        juce::HyperlinkButton flexCurveLink { "Check FlexCurve",
+            juce::URL ("https://github.com/Mixomo/CalCurve/tree/FlexCurve") };
+    };
+
+    class CrossfeedAdvancedContent final : public juce::Component
+    {
+    public:
+        explicit CrossfeedAdvancedContent (CalCurveAudioProcessor& p) : processor (p)
+        {
+            title.setText ("Advanced Crossfeed", juce::dontSendNotification);
+            title.setFont (juce::FontOptions (20.0f, juce::Font::bold));
+            title.setColour (juce::Label::textColourId, inkColour());
+            addAndMakeVisible (title);
+
+            setupCombo (algorithm);
+            algorithm.addItem ("Natural", 1);
+            algorithm.addItem ("BS2B", 2);
+            addAndMakeVisible (algorithm);
+
+            setupCombo (preset);
+            preset.addItem ("Natural Headphones", 1);
+            preset.addItem ("Nearfield 60 deg", 2);
+            preset.addItem ("Wide Speakers", 3);
+            preset.addItem ("BS2B Light", 4);
+            preset.addItem ("BS2B Strong", 5);
+            preset.onChange = [this] { applyPreset (preset.getSelectedId()); };
+            addAndMakeVisible (preset);
+
+            setupSlider (circumference, " cm");
+            setupSlider (headWidth, " cm");
+            setupSlider (headLength, " cm");
+            setupSlider (angle, " deg");
+            setupSlider (cutoff, " Hz");
+            setupSlider (direct, " %");
+
+            addRowLabel (circumferenceLabel, "Head circumference");
+            addRowLabel (headWidthLabel, "Head width");
+            addRowLabel (headLengthLabel, "Head length");
+            addRowLabel (angleLabel, "Speaker angle");
+            addRowLabel (cutoffLabel, "Cutoff");
+            addRowLabel (directLabel, "Direct level");
+
+            reset.setButtonText ("Reset");
+            reset.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1f2630));
+            reset.setColour (juce::TextButton::textColourOffId, inkColour());
+            reset.onClick = [this] { applyPreset (1); };
+            addAndMakeVisible (reset);
+
+            algorithmAttachment = std::make_unique<ComboBoxAttachment> (processor.parameters, "crossfeedalgorithm", algorithm);
+            circumferenceAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeedcircumference", circumference);
+            headWidthAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeedheadwidth", headWidth);
+            headLengthAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeedheadlength", headLength);
+            angleAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeedangle", angle);
+            cutoffAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeedcutoff", cutoff);
+            directAttachment = std::make_unique<SliderAttachment> (processor.parameters, "crossfeeddirect", direct);
+
+            setSize (560, 380);
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (panelColour());
+            g.setColour (juce::Colour (0xff38424f));
+            g.drawRect (getLocalBounds());
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced (18);
+            title.setBounds (area.removeFromTop (34));
+            auto top = area.removeFromTop (42);
+            algorithm.setBounds (top.removeFromLeft (180).withHeight (32));
+            top.removeFromLeft (12);
+            preset.setBounds (top.removeFromLeft (220).withHeight (32));
+            top.removeFromLeft (12);
+            reset.setBounds (top.removeFromLeft (90).withHeight (32));
+            area.removeFromTop (8);
+
+            layoutRow (area, circumferenceLabel, circumference);
+            layoutRow (area, headWidthLabel, headWidth);
+            layoutRow (area, headLengthLabel, headLength);
+            layoutRow (area, angleLabel, angle);
+            layoutRow (area, cutoffLabel, cutoff);
+            layoutRow (area, directLabel, direct);
+        }
+
+    private:
+        using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
+        using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+
+        void setupCombo (juce::ComboBox& combo)
+        {
+            combo.setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff1f2630));
+            combo.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff4a5664));
+            combo.setColour (juce::ComboBox::textColourId, inkColour());
+            combo.setColour (juce::ComboBox::arrowColourId, accentColour());
+        }
+
+        void setupSlider (juce::Slider& slider, const juce::String& suffix)
+        {
+            slider.setSliderStyle (juce::Slider::LinearHorizontal);
+            slider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 92, 24);
+            slider.setTextValueSuffix (suffix);
+            slider.setColour (juce::Slider::trackColourId, accentColour());
+            slider.setColour (juce::Slider::thumbColourId, juce::Colour (0xffe9f6f1));
+            slider.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff2b3540));
+            slider.setColour (juce::Slider::textBoxTextColourId, inkColour());
+            slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colour (0xff4a5664));
+            addAndMakeVisible (slider);
+        }
+
+        void addRowLabel (juce::Label& label, const juce::String& text)
+        {
+            label.setText (text, juce::dontSendNotification);
+            label.setColour (juce::Label::textColourId, juce::Colour (0xffdbe4ef));
+            addAndMakeVisible (label);
+        }
+
+        void layoutRow (juce::Rectangle<int>& area, juce::Label& label, juce::Slider& slider)
+        {
+            auto row = area.removeFromTop (38);
+            label.setBounds (row.removeFromLeft (150));
+            slider.setBounds (row);
+            area.removeFromTop (4);
+        }
+
+        void setFloat (const juce::String& id, float value)
+        {
+            if (auto* parameter = processor.parameters.getParameter (id))
+                parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
+        }
+
+        void setChoice (const juce::String& id, int index)
+        {
+            if (auto* parameter = processor.parameters.getParameter (id))
+                parameter->setValueNotifyingHost (parameter->convertTo0to1 (static_cast<float> (index)));
+        }
+
+        void applyPreset (int presetId)
+        {
+            switch (presetId)
+            {
+                case 2: setChoice ("crossfeedalgorithm", 0); setGeometry (57.0f, 15.0f, 19.0f, 60.0f, 700.0f, 100.0f); break;
+                case 3: setChoice ("crossfeedalgorithm", 0); setGeometry (57.0f, 15.0f, 19.0f, 75.0f, 850.0f, 100.0f); break;
+                case 4: setChoice ("crossfeedalgorithm", 1); setFloat ("crossfeedcutoff", 700.0f); setFloat ("crossfeeddirect", 100.0f); break;
+                case 5: setChoice ("crossfeedalgorithm", 1); setFloat ("crossfeedcutoff", 650.0f); setFloat ("crossfeeddirect", 92.0f); break;
+                default: setChoice ("crossfeedalgorithm", 0); setGeometry (57.0f, 15.0f, 19.0f, 45.0f, 700.0f, 100.0f); break;
+            }
+        }
+
+        void setGeometry (float circumferenceCm, float widthCm, float lengthCm, float speakerAngle, float cutoffHz, float directPercent)
+        {
+            setFloat ("crossfeedcircumference", circumferenceCm);
+            setFloat ("crossfeedheadwidth", widthCm);
+            setFloat ("crossfeedheadlength", lengthCm);
+            setFloat ("crossfeedangle", speakerAngle);
+            setFloat ("crossfeedcutoff", cutoffHz);
+            setFloat ("crossfeeddirect", directPercent);
+        }
+
+        CalCurveAudioProcessor& processor;
+        juce::Label title, circumferenceLabel, headWidthLabel, headLengthLabel, angleLabel, cutoffLabel, directLabel;
+        juce::ComboBox algorithm, preset;
+        juce::Slider circumference, headWidth, headLength, angle, cutoff, direct;
+        juce::TextButton reset;
+        std::unique_ptr<ComboBoxAttachment> algorithmAttachment;
+        std::unique_ptr<SliderAttachment> circumferenceAttachment, headWidthAttachment, headLengthAttachment;
+        std::unique_ptr<SliderAttachment> angleAttachment, cutoffAttachment, directAttachment;
     };
 
     int curveHash (const std::vector<CurvePoint>& points)
@@ -370,6 +549,12 @@ CalCurveAudioProcessorEditor::CalCurveAudioProcessorEditor (CalCurveAudioProcess
     help.onClick = [this] { showHelp(); };
     addAndMakeVisible (help);
 
+    crossfeedAdvanced.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1f2630));
+    crossfeedAdvanced.setColour (juce::TextButton::textColourOffId, inkColour());
+    crossfeedAdvanced.setTooltip ("Open advanced crossfeed algorithm and geometry settings");
+    crossfeedAdvanced.onClick = [this] { openCrossfeedAdvanced(); };
+    addAndMakeVisible (crossfeedAdvanced);
+
     presetCombo.setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff1f2630));
     presetCombo.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff4a5664));
     presetCombo.setColour (juce::ComboBox::textColourId, inkColour());
@@ -455,6 +640,7 @@ void CalCurveAudioProcessorEditor::resized()
 
     placeControl (dryWetArea, dryWet, dryWetLabel);
     placeControl (crossfeedArea, crossfeed, crossfeedLabel);
+    crossfeedAdvanced.setBounds (crossfeedArea.withTrimmedTop (142).removeFromTop (28).reduced (18, 0));
     placeControl (gainArea, gain, gainLabel);
 
     controls.removeFromLeft (32);
@@ -559,6 +745,18 @@ void CalCurveAudioProcessorEditor::showHelp()
     options.escapeKeyTriggersCloseButton = true;
     options.useNativeTitleBar = true;
     options.resizable = true;
+    options.launchAsync();
+}
+
+void CalCurveAudioProcessorEditor::openCrossfeedAdvanced()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.content.setOwned (new CrossfeedAdvancedContent (processor));
+    options.dialogTitle = "Advanced Crossfeed";
+    options.dialogBackgroundColour = panelColour();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = false;
     options.launchAsync();
 }
 
